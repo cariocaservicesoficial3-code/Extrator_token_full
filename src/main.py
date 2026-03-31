@@ -2,9 +2,9 @@
 # -*- coding: utf-8 -*-
 """
 ╔══════════════════════════════════════════════════════════════╗
-║     AJATO TOKEN GENERATOR V7.0 - PLAYWRIGHT EDITION         ║
+║     AJATO TOKEN GENERATOR V7.2 - PLAYWRIGHT EDITION         ║
 ║     Refatorado com Playwright para Kali Linux NetHunter      ║
-║     Baseado no HAR real de cadastro bem-sucedido             ║
+║     Integração OhMyCaptcha + Debug Logs Completo + ZIP       ║
 ╚══════════════════════════════════════════════════════════════╝
 
 Fluxo principal:
@@ -16,6 +16,13 @@ Fluxo principal:
   6. Ativar conta via link
   7. Fazer login e extrair token
   8. Salvar token no arquivo
+  9. Criar ZIP com logs + screenshots do ciclo
+
+NOVIDADES V7.2:
+  - Integração OhMyCaptcha (JS universal, stealth, mouse humano)
+  - Debug logs completo em /sdcard/nh_files/logs/
+  - ZIP automático por ciclo e sessão
+  - Correções de timeout/scroll para NetHunter
 """
 
 import os
@@ -31,7 +38,7 @@ from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config import (
-    C, OUTPUT_FILE, BASE_DIR, IS_NETHUNTER,
+    C, OUTPUT_FILE, BASE_DIR, IS_NETHUNTER, LOGS_DIR,
     EMAIL_CONFIRM_TIMEOUT, MAX_CADASTRO_RETRIES,
     MAX_LOGIN_RETRIES, MAX_RECOVER_RETRIES,
     MAX_REACTIVATION_ATTEMPTS, ACTIVATION_DELAY,
@@ -39,8 +46,11 @@ from config import (
 )
 from logger import (
     log, log_separator, log_stats, debug_write,
-    debug_separator, debug_session_start, debug_event,
-    debug_error, STATS, CURRENT_CYCLE,
+    debug_separator, debug_session_start, debug_session_end,
+    debug_event, debug_error,
+    criar_zip_ciclo, criar_zip_sessao,
+    limpar_screenshots, limpar_logs_ciclo,
+    STATS, CURRENT_CYCLE, SESSION_ID,
 )
 from emailnator_module import Emailnator
 from pessoa_generator import gerar_pessoa_4devs, gerar_senha
@@ -65,15 +75,18 @@ def print_banner():
 ║{C.CY}   | | | || |_| | | | | | | \\ \\_/ /                            {C.MG}║
 ║{C.CY}   \\_| |_/ \\___/\\_| |_/ \\_/  \\___/                             {C.MG}║
 ║                                                              ║
-║{C.G}   TOKEN GENERATOR V7.0 - PLAYWRIGHT EDITION                 {C.MG}║
+║{C.G}   TOKEN GENERATOR V7.2 - PLAYWRIGHT + OHMYCAPTCHA          {C.MG}║
 ║{C.Y}   Otimizado para Kali Linux NetHunter                       {C.MG}║
 ║{C.CY}   reCAPTCHA Enterprise via Browser Real                     {C.MG}║
+║{C.W}   Debug Logs + ZIP em /sdcard/nh_files/logs/               {C.MG}║
 ╚══════════════════════════════════════════════════════════════╝{C.R}
 """)
     env = "NetHunter" if IS_NETHUNTER else "Linux Desktop"
     log("INFO", f"Ambiente detectado: {C.G}{env}{C.R}")
     log("INFO", f"Output: {C.CY}{OUTPUT_FILE}{C.R}")
     log("INFO", f"Base dir: {C.CY}{BASE_DIR}{C.R}")
+    log("INFO", f"Logs dir: {C.CY}{LOGS_DIR}{C.R}")
+    log("INFO", f"Session ID: {C.CY}{SESSION_ID}{C.R}")
 
 
 # ==============================================================================
@@ -93,9 +106,11 @@ def salvar_token(token, email, cpf, nome, senha):
         log("TOKEN", f"  Email: {email}")
         log("TOKEN", f"  CPF: {cpf}")
         log("TOKEN", f"  Senha: {senha}")
+        debug_event("TOKEN_SAVED", f"#{STATS['tokens_gerados']} | {email} | {cpf}")
         return True
     except Exception as e:
         log("FAIL", f"Erro ao salvar token: {str(e)}")
+        debug_error(f"salvar_token: {str(e)}", traceback.format_exc())
         return False
 
 
@@ -106,14 +121,17 @@ def salvar_token(token, email, cpf, nome, senha):
 async def executar_ciclo(cycle_num, playwright):
     """Executa um ciclo completo de geração de token."""
     log_separator(f"CICLO #{cycle_num}")
+    cycle_start = time.time()
 
     browser = None
     context = None
     emailnator = None
+    token = None
+    status = None
 
     try:
         # =============================================
-        # INICIALIZAR BROWSER (compartilhado para tudo)
+        # INICIALIZAR BROWSER
         # =============================================
         log("PW", "Iniciando browser Playwright...")
         browser, context = await criar_browser(playwright)
@@ -125,7 +143,6 @@ async def executar_ciclo(cycle_num, playwright):
 
         emailnator = Emailnator(playwright_context=context)
 
-        # Tentar requests primeiro, fallback Playwright
         email = None
         for email_type in EMAIL_TYPES_PRIORITY:
             email = await emailnator.generate_email_async(email_type)
@@ -136,6 +153,7 @@ async def executar_ciclo(cycle_num, playwright):
             log("FAIL", "Nao foi possivel gerar email temporario!")
             STATS["cadastros_fail"] += 1
             await browser.close()
+            debug_session_end(cycle_num, False, error="email_generation_failed")
             return False
 
         log("OK", f"Email gerado: {C.G}{email}{C.R}")
@@ -157,6 +175,7 @@ async def executar_ciclo(cycle_num, playwright):
             STATS["cadastros_fail"] += 1
             await emailnator.close()
             await browser.close()
+            debug_session_end(cycle_num, False, error="pessoa_generation_failed")
             return False
 
         nome = pessoa.get("nome", "?")
@@ -169,7 +188,7 @@ async def executar_ciclo(cycle_num, playwright):
         log("DEBUG", f"  CEP: {pessoa.get('cep')} | Cidade: {pessoa.get('cidade')}/{pessoa.get('estado')}")
 
         # Atualizar ciclo atual
-        CURRENT_CYCLE.update({"num": cycle_num, "email": email, "cpf": cpf, "nome": nome})
+        CURRENT_CYCLE.update({"num": cycle_num, "email": email, "cpf": cpf, "nome": nome, "start_time": cycle_start})
         debug_session_start(cycle_num, email, cpf, nome)
 
         # =============================================
@@ -197,6 +216,7 @@ async def executar_ciclo(cycle_num, playwright):
         if not cadastro_ok:
             log("FAIL", f"Cadastro falhou apos {MAX_CADASTRO_RETRIES} tentativas!")
             STATS["cadastros_fail"] += 1
+            debug_session_end(cycle_num, False, error="cadastro_failed")
             await emailnator.close()
             await browser.close()
             return False
@@ -213,7 +233,6 @@ async def executar_ciclo(cycle_num, playwright):
         )
 
         if not confirmation_link:
-            # Tentar aceitar qualquer email
             log("WARN", "Email da Movida nao chegou, tentando qualquer email...")
             confirmation_link = await emailnator.wait_for_email_async(
                 sender_filter="",
@@ -226,20 +245,23 @@ async def executar_ciclo(cycle_num, playwright):
             log("FAIL", "Email de confirmacao nao chegou!")
             STATS["emails_timeout"] += 1
 
-            # Tentar login direto (alguns cadastros não precisam confirmação)
+            # Tentar login direto
             log("WARN", "Tentando login direto sem confirmacao...")
             token, status = await fazer_login_playwright(context, cpf_numeros, senha)
             if token and status == "ok":
                 salvar_token(token, email, cpf, nome, senha)
+                debug_session_end(cycle_num, True, token=token[:30])
                 await emailnator.close()
                 await browser.close()
                 return True
 
+            debug_session_end(cycle_num, False, error="email_timeout")
             await emailnator.close()
             await browser.close()
             return False
 
         log("OK", f"Link de confirmacao: {confirmation_link[:80]}...")
+        STATS["emails_recebidos"] += 1
 
         # =============================================
         # PASSO 8: Ativar Conta
@@ -257,9 +279,6 @@ async def executar_ciclo(cycle_num, playwright):
         # PASSO 9: Login e Extração de Token
         # =============================================
         log("STEP", "PASSO 9: Fazendo login e extraindo token...")
-
-        token = None
-        status = None
 
         for login_try in range(1, MAX_LOGIN_RETRIES + 1):
             log("DEBUG", f"Tentativa de login {login_try}/{MAX_LOGIN_RETRIES}...")
@@ -316,13 +335,17 @@ async def executar_ciclo(cycle_num, playwright):
         # =============================================
         if token and status == "ok":
             salvar_token(token, email, cpf, nome, senha)
-            log("OK", f"{C.BG_G}{C.W} CICLO #{cycle_num} CONCLUIDO COM SUCESSO! {C.R}")
+            elapsed = time.time() - cycle_start
+            log("OK", f"{C.BG_G}{C.W} CICLO #{cycle_num} CONCLUIDO COM SUCESSO! ({elapsed:.1f}s) {C.R}")
+            debug_session_end(cycle_num, True, token=token[:30])
             await emailnator.close()
             await browser.close()
             return True
         else:
-            log("FAIL", f"Ciclo #{cycle_num} falhou! Status final: {status}")
+            elapsed = time.time() - cycle_start
+            log("FAIL", f"Ciclo #{cycle_num} falhou! Status final: {status} ({elapsed:.1f}s)")
             STATS["logins_fail"] += 1
+            debug_session_end(cycle_num, False, error=f"login_{status}")
             await emailnator.close()
             await browser.close()
             return False
@@ -330,6 +353,7 @@ async def executar_ciclo(cycle_num, playwright):
     except Exception as e:
         log("FAIL", f"Erro no ciclo #{cycle_num}: {str(e)}")
         debug_error(f"Ciclo #{cycle_num}: {str(e)}", traceback.format_exc())
+        debug_session_end(cycle_num, False, error=f"exception: {str(e)[:100]}")
         if emailnator:
             try:
                 await emailnator.close()
@@ -362,7 +386,21 @@ async def main_loop():
             cycle_num += 1
 
             try:
+                # Limpar screenshots do ciclo anterior
+                limpar_screenshots()
+
                 success = await executar_ciclo(cycle_num, playwright)
+
+                # =============================================
+                # ZIP DO CICLO (logs + screenshots)
+                # =============================================
+                zip_path = criar_zip_ciclo(cycle_num, include_screenshots=True)
+                if zip_path:
+                    log("ZIP", f"Logs do ciclo #{cycle_num} compactados!")
+                    log("ZIP", f"Arquivo: {zip_path}")
+
+                # Rotacionar logs se muito grandes
+                limpar_logs_ciclo()
 
                 if success:
                     consecutive_fails = 0
@@ -386,6 +424,8 @@ async def main_loop():
             except Exception as e:
                 log("FAIL", f"Erro fatal no ciclo #{cycle_num}: {str(e)}")
                 debug_error(f"Fatal ciclo #{cycle_num}: {str(e)}", traceback.format_exc())
+                # ZIP mesmo em caso de erro fatal
+                criar_zip_ciclo(cycle_num, include_screenshots=True)
                 consecutive_fails += 1
                 await asyncio.sleep(5)
 
@@ -396,10 +436,13 @@ async def main_loop():
 
 def main():
     """Entry point do script."""
-    # Tratar Ctrl+C gracefully
     def signal_handler(sig, frame):
         print(f"\n{C.Y}[INFO]{C.R} Encerrando gracefully...")
         log_stats()
+        # Criar ZIP final da sessão
+        zip_path = criar_zip_sessao()
+        if zip_path:
+            print(f"{C.G}[ZIP]{C.R} Sessao completa salva em: {zip_path}")
         sys.exit(0)
 
     signal.signal(signal.SIGINT, signal_handler)
@@ -410,9 +453,15 @@ def main():
     except KeyboardInterrupt:
         print(f"\n{C.Y}[INFO]{C.R} Encerrado pelo usuario.")
         log_stats()
+        # ZIP final
+        zip_path = criar_zip_sessao()
+        if zip_path:
+            print(f"{C.G}[ZIP]{C.R} Sessao completa: {zip_path}")
     except Exception as e:
         print(f"\n{C.RD}[FATAL]{C.R} {str(e)}")
         traceback.print_exc()
+        # ZIP mesmo em caso de crash
+        criar_zip_sessao()
         sys.exit(1)
 
 

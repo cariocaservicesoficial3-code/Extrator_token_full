@@ -1,18 +1,28 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-AJATO TOKEN GENERATOR V7.0 - Módulo Movida Playwright
+AJATO TOKEN GENERATOR V7.2 - Módulo Movida Playwright
 Cadastro, ativação e login via Playwright (navegador headless real).
 
-BASEADO NO HAR REAL DE CADASTRO BEM-SUCEDIDO:
-  Fluxo: GET cadastro -> validate CPF -> busca_cep -> lista-estado-cidades
-         -> reCAPTCHA enterprise/reload -> POST enviar-cadastro (HTTP 303)
+INTEGRAÇÃO OHMYCAPTCHA (shenhao-stu/ohmycaptcha):
+  - JS universal para reCAPTCHA v3/Enterprise com fallback de injeção
+  - Stealth JS melhorado (window.chrome, navigator.plugins)
+  - Mouse movement humano antes do reCAPTCHA (melhora score)
+  - Retry robusto com validação de token
+
+CORREÇÕES V7.2:
+  - Timeouts aumentados (60s) para NetHunter
+  - Scroll automático antes de clicar em elementos fora do viewport
+  - wait_until="domcontentloaded" ao invés de "networkidle" (mais rápido)
+  - force=True + JS click fallback em radio/checkbox
+  - Debug completo de cada ação do Playwright
 """
 
 import re
 import os
 import json
 import time
+import random
 import asyncio
 import traceback
 import requests
@@ -25,15 +35,339 @@ from config import (
     RECAPTCHA_SITE_KEY, USER_AGENT_WEBVIEW,
     CHROMIUM_ARGS, VIEWPORT, SCREENSHOTS_DIR,
     PAGE_LOAD_TIMEOUT, NAVIGATION_TIMEOUT,
+    ELEMENT_TIMEOUT, RECAPTCHA_TIMEOUT,
     ACTIVATION_DELAY, MAX_LOGIN_RETRIES,
 )
-from logger import log, debug_event, debug_error, debug_write, STATS
+from logger import (
+    log, debug_event, debug_error, debug_write,
+    debug_request, debug_response,
+    debug_pw_action, debug_pw_navigation, debug_pw_element,
+    debug_pw_screenshot, debug_pw_html, debug_pw_js_eval,
+    debug_pw_error,
+    STATS,
+)
 from pessoa_generator import get_cidade_ibge
 
+
+# ==============================================================================
+# OHMYCAPTCHA - JS UNIVERSAL PARA reCAPTCHA v3/Enterprise
+# Fonte: https://github.com/shenhao-stu/ohmycaptcha
+# ==============================================================================
+
+# JS que detecta grecaptcha.enterprise OU grecaptcha padrão automaticamente.
+# Se nenhum estiver carregado, INJETA o script do Google e tenta novamente.
+_RECAPTCHA_EXECUTE_JS = """
+([key, action]) => new Promise((resolve, reject) => {
+    const gr = window.grecaptcha?.enterprise || window.grecaptcha;
+    if (gr && typeof gr.execute === 'function') {
+        gr.ready(() => {
+            gr.execute(key, {action}).then(resolve).catch(reject);
+        });
+        return;
+    }
+    // grecaptcha not loaded yet — inject the script ourselves
+    const script = document.createElement('script');
+    script.src = 'https://www.google.com/recaptcha/enterprise.js?render=' + key;
+    script.onerror = () => reject(new Error('Failed to load reCAPTCHA Enterprise script'));
+    script.onload = () => {
+        const g = window.grecaptcha?.enterprise || window.grecaptcha;
+        if (!g) { reject(new Error('grecaptcha still undefined after script load')); return; }
+        g.ready(() => {
+            g.execute(key, {action}).then(resolve).catch(reject);
+        });
+    };
+    document.head.appendChild(script);
+})
+"""
+
+# Stealth JS melhorado (ohmycaptcha + customizações)
+_STEALTH_JS = """
+// Anti-detecção: remover webdriver
+Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+
+// Idioma brasileiro
+Object.defineProperty(navigator, 'languages', {get: () => ['pt-BR', 'pt', 'en-US', 'en']});
+
+// Simular plugins reais (ohmycaptcha technique)
+Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+
+// Simular Chrome real (ohmycaptcha technique)
+window.chrome = {runtime: {}, loadTimes: () => {}, csi: () => {}};
+
+// Platform Android
+Object.defineProperty(navigator, 'platform', {get: () => 'Linux armv8l'});
+
+// Permissions
+const originalQuery = window.navigator.permissions.query;
+window.navigator.permissions.query = (parameters) => (
+    parameters.name === 'notifications' ?
+        Promise.resolve({ state: Notification.permission }) :
+        originalQuery(parameters)
+);
+
+// Limpar marcadores de automação
+delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
+delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
+delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
+"""
+
+# JS para extrair token do reCAPTCHA (múltiplos métodos - ohmycaptcha v2 technique)
+_EXTRACT_TOKEN_JS = """
+() => {
+    const textarea = document.querySelector('#g-recaptcha-response')
+        || document.querySelector('[name="g-recaptcha-response"]')
+        || document.querySelector('textarea.g-recaptcha-response');
+    if (textarea && textarea.value && textarea.value.length > 20) {
+        return textarea.value;
+    }
+    const gr = window.grecaptcha?.enterprise || window.grecaptcha;
+    if (gr && typeof gr.getResponse === 'function') {
+        const resp = gr.getResponse();
+        if (resp && resp.length > 20) return resp;
+    }
+    return null;
+}
+"""
+
+
+# ==============================================================================
+# UTILITÁRIOS
+# ==============================================================================
+
+def random_delay():
+    """Delay aleatório para simular digitação humana (ms)."""
+    return random.randint(30, 80)
+
+
+async def simulate_human_mouse(page):
+    """Simula movimentos de mouse humanos (técnica ohmycaptcha - melhora score reCAPTCHA)."""
+    try:
+        vw = VIEWPORT["width"]
+        vh = VIEWPORT["height"]
+        # Movimentos aleatórios suaves
+        x1, y1 = random.randint(50, vw - 50), random.randint(50, vh // 2)
+        x2, y2 = random.randint(50, vw - 50), random.randint(vh // 2, vh - 50)
+        x3, y3 = random.randint(50, vw - 50), random.randint(100, vh - 100)
+
+        await page.mouse.move(x1, y1)
+        await asyncio.sleep(random.uniform(0.3, 0.8))
+        await page.mouse.move(x2, y2)
+        await asyncio.sleep(random.uniform(0.2, 0.5))
+        await page.mouse.move(x3, y3)
+        await asyncio.sleep(random.uniform(0.3, 0.6))
+
+        debug_pw_action("human_mouse", f"Moved: ({x1},{y1})->({x2},{y2})->({x3},{y3})")
+    except Exception as e:
+        debug_pw_error("human_mouse", str(e))
+
+
+async def safe_scroll_to(page, selector):
+    """Faz scroll até o elemento ficar visível no viewport."""
+    try:
+        await page.evaluate(f"""
+            () => {{
+                const el = document.querySelector('{selector}');
+                if (el) {{
+                    el.scrollIntoView({{ behavior: 'smooth', block: 'center' }});
+                }}
+            }}
+        """)
+        await asyncio.sleep(0.5)
+        debug_pw_action("scroll_to", f"Scrolled to: {selector}")
+    except Exception as e:
+        debug_pw_error("scroll_to", str(e))
+
+
+async def safe_click(page, selector, force=False, scroll=True, timeout=None):
+    """Click seguro com scroll automático e fallback JS."""
+    timeout = timeout or ELEMENT_TIMEOUT
+    try:
+        if scroll:
+            await safe_scroll_to(page, selector)
+
+        locator = page.locator(selector)
+        count = await locator.count()
+        debug_pw_element(selector, "click", f"count={count}, force={force}")
+
+        if count > 0:
+            try:
+                await locator.first.click(force=force, timeout=timeout)
+                debug_pw_element(selector, "click", "OK", success=True)
+                return True
+            except Exception as e1:
+                # Fallback: JS click
+                debug_pw_error(f"click({selector})", f"Playwright click falhou: {e1}, tentando JS click")
+                try:
+                    result = await page.evaluate(f"""
+                        () => {{
+                            const el = document.querySelector('{selector}');
+                            if (el) {{ el.click(); return true; }}
+                            return false;
+                        }}
+                    """)
+                    if result:
+                        debug_pw_element(selector, "js_click", "OK (fallback)", success=True)
+                        return True
+                    else:
+                        debug_pw_element(selector, "js_click", "Elemento nao encontrado via JS", success=False)
+                        return False
+                except Exception as e2:
+                    debug_pw_error(f"js_click({selector})", str(e2))
+                    return False
+        else:
+            debug_pw_element(selector, "click", "Elemento nao encontrado", success=False)
+            return False
+    except Exception as e:
+        debug_pw_error(f"safe_click({selector})", str(e))
+        return False
+
+
+async def safe_fill(page, selector, value, use_type=False, delay=None):
+    """Preenchimento seguro com scroll e debug."""
+    try:
+        await safe_scroll_to(page, selector)
+        locator = page.locator(selector)
+        count = await locator.count()
+
+        if count > 0:
+            await locator.first.click(timeout=ELEMENT_TIMEOUT)
+            await locator.first.fill("", timeout=ELEMENT_TIMEOUT)
+
+            if use_type:
+                d = delay or random_delay()
+                await locator.first.type(value, delay=d, timeout=ELEMENT_TIMEOUT)
+            else:
+                await locator.first.fill(value, timeout=ELEMENT_TIMEOUT)
+
+            debug_pw_element(selector, "fill", value[:50], success=True)
+            return True
+        else:
+            debug_pw_element(selector, "fill", "Elemento nao encontrado", success=False)
+            return False
+    except Exception as e:
+        debug_pw_error(f"safe_fill({selector})", str(e))
+        return False
+
+
+async def screenshot_debug(page, name):
+    """Salva screenshot para debug com log detalhado."""
+    try:
+        ts = datetime.now().strftime("%H%M%S")
+        path = os.path.join(SCREENSHOTS_DIR, f"{ts}_{name}.png")
+        await page.screenshot(path=path, full_page=True)
+        debug_pw_screenshot(name, path)
+        log("DEBUG", f"Screenshot salvo: {name}")
+
+        # Log do HTML da página
+        try:
+            title = await page.title()
+            url = page.url
+            html = await page.content()
+            debug_pw_html(title, url, html[:3000])
+        except Exception:
+            pass
+
+        return path
+    except Exception as e:
+        debug_pw_error("screenshot", str(e))
+        return None
+
+
+# ==============================================================================
+# RESOLVER reCAPTCHA ENTERPRISE (INTEGRAÇÃO OHMYCAPTCHA)
+# ==============================================================================
+
+async def resolver_recaptcha_enterprise(page, action="signup"):
+    """
+    Resolve reCAPTCHA Enterprise usando técnicas do ohmycaptcha.
+    1. Simula mouse humano (melhora score)
+    2. Aguarda grecaptcha carregar
+    3. Usa JS universal com fallback de injeção
+    4. Valida token
+    5. Injeta no formulário
+    """
+    log("CAPTCHA", "Resolvendo reCAPTCHA Enterprise (ohmycaptcha method)...")
+    debug_pw_action("recaptcha_start", f"Action: {action}, SiteKey: {RECAPTCHA_SITE_KEY}")
+
+    # 1. Simular comportamento humano (melhora score do reCAPTCHA)
+    await simulate_human_mouse(page)
+
+    # 2. Aguardar reCAPTCHA carregar
+    try:
+        await page.wait_for_function(
+            "(typeof grecaptcha !== 'undefined' && typeof grecaptcha.execute === 'function') "
+            "|| (typeof grecaptcha !== 'undefined' && typeof grecaptcha?.enterprise?.execute === 'function')",
+            timeout=RECAPTCHA_TIMEOUT
+        )
+        log("OK", "reCAPTCHA Enterprise detectado na pagina!")
+        debug_pw_js_eval("recaptcha_detect", "loaded", success=True)
+    except Exception:
+        log("WARN", "reCAPTCHA nao detectado, JS universal vai tentar injetar...")
+        debug_pw_action("recaptcha_not_found", "Will attempt script injection via _EXECUTE_JS")
+
+    # 3. Executar JS universal (com retry - técnica ohmycaptcha)
+    captcha_token = None
+    last_error = None
+
+    for attempt in range(3):
+        try:
+            captcha_token = await page.evaluate(
+                _RECAPTCHA_EXECUTE_JS,
+                [RECAPTCHA_SITE_KEY, action]
+            )
+
+            if isinstance(captcha_token, str) and len(captcha_token) > 20:
+                log("OK", f"reCAPTCHA Enterprise RESOLVIDO! ({len(captcha_token)} chars) [tentativa {attempt+1}]")
+                debug_pw_js_eval("recaptcha_execute", f"Token: {len(captcha_token)} chars, attempt: {attempt+1}", success=True)
+                break
+            else:
+                last_error = f"Token invalido: {captcha_token!r}"
+                debug_pw_error("recaptcha_execute", f"Attempt {attempt+1}: {last_error}")
+                captcha_token = None
+
+        except Exception as e:
+            last_error = str(e)
+            log("WARN", f"reCAPTCHA tentativa {attempt+1}/3 falhou: {last_error}")
+            debug_pw_error("recaptcha_execute", f"Attempt {attempt+1}: {last_error}")
+            if attempt < 2:
+                await asyncio.sleep(2)
+
+    if not captcha_token:
+        log("FAIL", f"reCAPTCHA Enterprise falhou apos 3 tentativas! Ultimo erro: {last_error}")
+        return None
+
+    # 4. Injetar token no formulário
+    try:
+        await page.evaluate(f"""
+            () => {{
+                let existing = document.querySelector('input[name="g-recaptcha-response"]') ||
+                               document.querySelector('textarea[name="g-recaptcha-response"]') ||
+                               document.querySelector('textarea.g-recaptcha-response');
+                if (!existing) {{
+                    existing = document.createElement('textarea');
+                    existing.name = 'g-recaptcha-response';
+                    existing.style.display = 'none';
+                    const form = document.getElementById('formCadastro') || document.forms[0];
+                    if (form) form.appendChild(existing);
+                }}
+                existing.value = `{captcha_token}`;
+            }}
+        """)
+        debug_pw_action("inject_captcha_token", f"Injetado {len(captcha_token)} chars no form")
+    except Exception as e:
+        debug_pw_error("inject_captcha_token", str(e))
+
+    return captcha_token
+
+
+# ==============================================================================
+# CRIAR BROWSER
+# ==============================================================================
 
 async def criar_browser(playwright):
     """Cria instância do browser Playwright otimizada para NetHunter."""
     log("PW", "Iniciando Chromium headless...")
+    debug_pw_action("launch", f"Args: {len(CHROMIUM_ARGS)} flags")
 
     browser = await playwright.chromium.launch(
         headless=True,
@@ -51,40 +385,12 @@ async def criar_browser(playwright):
         },
     )
 
-    # Anti-detecção: remover webdriver flag
-    await context.add_init_script("""
-        Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-        Object.defineProperty(navigator, 'languages', {get: () => ['pt-BR', 'pt', 'en']});
-        Object.defineProperty(navigator, 'platform', {get: () => 'Linux armv8l'});
+    # Stealth JS melhorado (ohmycaptcha + custom)
+    await context.add_init_script(_STEALTH_JS)
 
-        // Override permissions
-        const originalQuery = window.navigator.permissions.query;
-        window.navigator.permissions.query = (parameters) => (
-            parameters.name === 'notifications' ?
-                Promise.resolve({ state: Notification.permission }) :
-                originalQuery(parameters)
-        );
-
-        // Remove automation indicators
-        delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
-        delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
-        delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
-    """)
-
+    debug_pw_action("browser_ready", f"Viewport: {VIEWPORT}, UA: {USER_AGENT_WEBVIEW[:60]}...")
     log("OK", "Browser Chromium iniciado com sucesso!")
     return browser, context
-
-
-async def screenshot_debug(page, name):
-    """Salva screenshot para debug."""
-    try:
-        ts = datetime.now().strftime("%H%M%S")
-        path = os.path.join(SCREENSHOTS_DIR, f"{ts}_{name}.png")
-        await page.screenshot(path=path, full_page=False)
-        log("DEBUG", f"Screenshot salvo: {name}")
-        return path
-    except Exception:
-        return None
 
 
 # ==============================================================================
@@ -94,11 +400,10 @@ async def screenshot_debug(page, name):
 async def fazer_cadastro_playwright(context, pessoa, email, senha):
     """
     Realiza cadastro na Movida usando Playwright.
-    Simula interação humana real no formulário.
-    Fluxo baseado no HAR real que deu HTTP 303 (sucesso).
+    V7.2: Integração ohmycaptcha + debug completo + scroll fix.
     """
     page = await context.new_page()
-    page.set_default_timeout(PAGE_LOAD_TIMEOUT)
+    page.set_default_timeout(ELEMENT_TIMEOUT)
     page.set_default_navigation_timeout(NAVIGATION_TIMEOUT)
 
     cpf_formatado = pessoa["cpf"]
@@ -111,74 +416,89 @@ async def fazer_cadastro_playwright(context, pessoa, email, senha):
         # PASSO 1: Carregar página de cadastro
         # =============================================
         log("STEP", "PASSO 4: Carregando pagina de cadastro...")
-        await page.goto(CADASTRO_URL, wait_until="networkidle", timeout=NAVIGATION_TIMEOUT)
-        await page.wait_for_selector("#formCadastro", timeout=15000)
+        debug_pw_navigation(CADASTRO_URL, wait_until="domcontentloaded")
+
+        await page.goto(CADASTRO_URL, wait_until="domcontentloaded", timeout=NAVIGATION_TIMEOUT)
+
+        # Aguardar o formulário aparecer
+        try:
+            await page.wait_for_selector("#formCadastro", timeout=30000)
+        except Exception:
+            log("WARN", "Formulario demorou, aguardando mais...")
+            await asyncio.sleep(5)
+            form_exists = await page.locator("#formCadastro").count()
+            if form_exists == 0:
+                log("FAIL", "Formulario de cadastro NAO encontrado!")
+                await screenshot_debug(page, "error_no_form")
+                await page.close()
+                return False
+
         log("OK", "Pagina de cadastro carregada!")
-
         await screenshot_debug(page, "01_cadastro_loaded")
-
-        # Aguardar reCAPTCHA Enterprise carregar
-        await page.wait_for_function(
-            "typeof grecaptcha !== 'undefined' && typeof grecaptcha.enterprise !== 'undefined'",
-            timeout=15000
-        )
-        log("OK", "reCAPTCHA Enterprise carregado!")
 
         # =============================================
         # PASSO 2: Preencher Informações Pessoais
         # =============================================
         log("STEP", "PASSO 5: Preenchendo formulario de cadastro...")
 
-        # Selecionar "Brasileiro"
-        brasileiro_radio = page.locator("#brasileiro")
-        if await brasileiro_radio.count() > 0:
-            await brasileiro_radio.click()
-            await asyncio.sleep(0.3)
-
-        # CPF
-        await page.locator("#cpf").click()
-        await page.locator("#cpf").fill("")
-        await page.locator("#cpf").type(cpf_formatado, delay=random_delay())
+        # Selecionar "Brasileiro" (scroll + force + JS fallback)
+        debug_pw_action("select_nationality", "Brasileiro")
+        clicked = await safe_click(page, "#brasileiro", force=True, scroll=True)
+        if not clicked:
+            await safe_click(page, 'label[for="brasileiro"]', force=True, scroll=True)
         await asyncio.sleep(0.5)
 
-        # Trigger blur para validação de CPF (dispara AJAX validate)
-        await page.locator("#cpf").evaluate("el => el.dispatchEvent(new Event('blur'))")
+        # CPF
+        await safe_fill(page, "#cpf", cpf_formatado, use_type=True)
+        await asyncio.sleep(0.5)
+
+        # Trigger blur para validação AJAX do CPF
+        try:
+            await page.locator("#cpf").evaluate("el => el.dispatchEvent(new Event('blur'))")
+            debug_pw_action("cpf_blur", "Disparado evento blur para validacao AJAX")
+        except Exception:
+            pass
         log("DEBUG", f"CPF preenchido: {cpf_formatado}")
 
         # Aguardar validação AJAX do CPF
-        await asyncio.sleep(1.5)
+        await asyncio.sleep(2.0)
+
+        # Verificar se CPF foi rejeitado
+        try:
+            page_html = await page.content()
+            if "CPF já cadastrado" in page_html or "cpf já" in page_html.lower():
+                log("FAIL", "CPF ja cadastrado na Movida!")
+                debug_pw_action("cpf_rejected", "CPF ja cadastrado")
+                await page.close()
+                return False
+        except Exception:
+            pass
 
         # Nome
-        await page.locator("#nome").click()
-        await page.locator("#nome").type(pessoa["nome"], delay=random_delay())
+        await safe_fill(page, "#nome", pessoa["nome"], use_type=True)
         await asyncio.sleep(0.3)
 
         # Data de Nascimento
-        await page.locator("#data_nasc").click()
-        await page.locator("#data_nasc").type(pessoa["data_nasc"], delay=random_delay())
+        await safe_fill(page, "#data_nasc", pessoa["data_nasc"], use_type=True)
         await asyncio.sleep(0.3)
 
-        # Telefone (opcional mas preenchemos)
+        # Telefone
         telefone = pessoa.get("telefone_fixo", "")
         if telefone:
-            await page.locator("#telefone").click()
-            await page.locator("#telefone").type(telefone, delay=random_delay())
+            await safe_fill(page, "#telefone", telefone, use_type=True)
             await asyncio.sleep(0.2)
 
         # Celular
         celular = pessoa.get("celular", "(11) 99999-9999")
-        await page.locator("#celular").click()
-        await page.locator("#celular").type(celular, delay=random_delay())
+        await safe_fill(page, "#celular", celular, use_type=True)
         await asyncio.sleep(0.3)
 
         # Email
-        await page.locator("#email").click()
-        await page.locator("#email").type(email, delay=random_delay())
+        await safe_fill(page, "#email", email, use_type=True)
         await asyncio.sleep(0.3)
 
         # Confirmação Email
-        await page.locator("#email_conf").click()
-        await page.locator("#email_conf").type(email, delay=random_delay())
+        await safe_fill(page, "#email_conf", email, use_type=True)
         await asyncio.sleep(0.3)
 
         log("OK", "Informacoes pessoais preenchidas!")
@@ -189,58 +509,78 @@ async def fazer_cadastro_playwright(context, pessoa, email, senha):
         # =============================================
         log("STEP", "Preenchendo endereco...")
 
-        # CEP (dispara busca automática)
-        await page.locator("#cep").click()
-        await page.locator("#cep").fill("")
-        await page.locator("#cep").type(cep_raw, delay=random_delay())
-        await page.locator("#cep").evaluate("el => el.dispatchEvent(new Event('blur'))")
+        # CEP
+        await safe_fill(page, "#cep", cep_raw, use_type=True)
+        try:
+            await page.locator("#cep").evaluate("el => el.dispatchEvent(new Event('blur'))")
+            debug_pw_action("cep_blur", "Disparado evento blur para busca_cep AJAX")
+        except Exception:
+            pass
         log("DEBUG", f"CEP preenchido: {cep_raw}")
 
-        # Aguardar auto-preenchimento do CEP (AJAX busca_cep)
-        await asyncio.sleep(2.0)
+        # Aguardar auto-preenchimento do CEP
+        await asyncio.sleep(3.0)
 
         # Verificar se logradouro foi auto-preenchido
-        logradouro_val = await page.locator("#logradouro").input_value()
-        if not logradouro_val:
-            # Preencher manualmente se auto-preenchimento falhou
-            log("WARN", "Auto-preenchimento do CEP falhou, preenchendo manualmente...")
-            await page.locator("#logradouro").fill(pessoa.get("endereco", "Rua Exemplo"))
-            await page.locator("#bairro").fill(pessoa.get("bairro", "Centro"))
-        else:
-            log("OK", f"CEP auto-preencheu: {logradouro_val}")
+        try:
+            logradouro_val = await page.locator("#logradouro").input_value()
+            if not logradouro_val:
+                log("WARN", "Auto-preenchimento do CEP falhou, preenchendo manualmente...")
+                await safe_fill(page, "#logradouro", pessoa.get("endereco", "Rua Exemplo"))
+                await safe_fill(page, "#bairro", pessoa.get("bairro", "Centro"))
+            else:
+                log("OK", f"CEP auto-preencheu: {logradouro_val}")
+                debug_pw_element("#logradouro", "auto-fill", logradouro_val)
+        except Exception as e:
+            debug_pw_error("logradouro_check", str(e))
 
         # Número
-        await page.locator("#numero").click()
-        await page.locator("#numero").type(str(pessoa.get("numero", "100")), delay=random_delay())
+        await safe_fill(page, "#numero", str(pessoa.get("numero", "100")), use_type=True)
         await asyncio.sleep(0.3)
 
         # País (Brasil = value "1")
-        pais_select = page.locator("#Pais")
-        if await pais_select.count() > 0:
-            await pais_select.select_option(value="1")
-            await asyncio.sleep(0.3)
+        try:
+            pais_count = await page.locator("#Pais").count()
+            if pais_count > 0:
+                await safe_scroll_to(page, "#Pais")
+                await page.locator("#Pais").select_option(value="1", timeout=ELEMENT_TIMEOUT)
+                debug_pw_element("#Pais", "select", "1 (Brasil)")
+                await asyncio.sleep(0.5)
+        except Exception as e:
+            debug_pw_error("pais_select", str(e))
 
         # Estado
-        uf_select = page.locator("#uf_sel")
-        if await uf_select.count() > 0:
-            estado = pessoa.get("estado", "SP")
-            await uf_select.select_option(value=estado)
-            await asyncio.sleep(1.0)  # Aguardar carregamento das cidades
+        try:
+            uf_count = await page.locator("#uf_sel").count()
+            if uf_count > 0:
+                estado = pessoa.get("estado", "SP")
+                await safe_scroll_to(page, "#uf_sel")
+                await page.locator("#uf_sel").select_option(value=estado, timeout=ELEMENT_TIMEOUT)
+                debug_pw_element("#uf_sel", "select", estado)
+                await asyncio.sleep(1.5)
+        except Exception as e:
+            debug_pw_error("uf_select", str(e))
 
         # Cidade (código IBGE)
-        cidade_select = page.locator("#cidade_sel")
-        if await cidade_select.count() > 0:
-            cidade_ibge = get_cidade_ibge(pessoa.get("cidade", ""))
-            try:
-                await cidade_select.select_option(value=cidade_ibge)
-            except Exception:
-                # Tentar pelo texto da cidade
-                cidade_nome = pessoa.get("cidade", "").upper()
+        try:
+            cidade_count = await page.locator("#cidade_sel").count()
+            if cidade_count > 0:
+                cidade_ibge = get_cidade_ibge(pessoa.get("cidade", ""))
+                await safe_scroll_to(page, "#cidade_sel")
                 try:
-                    await cidade_select.select_option(label=cidade_nome)
+                    await page.locator("#cidade_sel").select_option(value=cidade_ibge, timeout=ELEMENT_TIMEOUT)
+                    debug_pw_element("#cidade_sel", "select", f"{cidade_ibge} ({pessoa.get('cidade', '')})")
                 except Exception:
-                    log("WARN", f"Nao conseguiu selecionar cidade: {cidade_nome}")
-            await asyncio.sleep(0.3)
+                    cidade_nome = pessoa.get("cidade", "").upper()
+                    try:
+                        await page.locator("#cidade_sel").select_option(label=cidade_nome, timeout=ELEMENT_TIMEOUT)
+                        debug_pw_element("#cidade_sel", "select_label", cidade_nome)
+                    except Exception as e2:
+                        log("WARN", f"Nao conseguiu selecionar cidade: {cidade_nome}")
+                        debug_pw_error("cidade_select", str(e2))
+                await asyncio.sleep(0.5)
+        except Exception as e:
+            debug_pw_error("cidade_block", str(e))
 
         log("OK", "Endereco preenchido!")
         await screenshot_debug(page, "03_endereco_ok")
@@ -250,173 +590,123 @@ async def fazer_cadastro_playwright(context, pessoa, email, senha):
         # =============================================
         log("STEP", "Preenchendo senha...")
 
-        await page.locator("#senha_cadastro").click()
-        await page.locator("#senha_cadastro").type(senha, delay=random_delay())
+        await safe_fill(page, "#senha_cadastro", senha, use_type=True)
         await asyncio.sleep(0.3)
-
-        await page.locator("#senha_conf").click()
-        await page.locator("#senha_conf").type(senha, delay=random_delay())
+        await safe_fill(page, "#senha_conf", senha, use_type=True)
         await asyncio.sleep(0.3)
 
         log("OK", f"Senha preenchida: {senha}")
 
         # =============================================
-        # PASSO 5: Checkboxes (conforme HAR real)
+        # PASSO 5: Checkboxes
         # =============================================
         log("STEP", "Marcando checkboxes...")
 
-        # ofertasFidelidade
-        ofertas_cb = page.locator("#ofertasFidelidade")
-        if await ofertas_cb.count() > 0:
-            is_checked = await ofertas_cb.is_checked()
-            if not is_checked:
-                await ofertas_cb.click(force=True)
-                await asyncio.sleep(0.2)
+        checkboxes = [
+            ("#ofertasFidelidade", "Ofertas Fidelidade"),
+            ("#politicaPrivacidade", "Politica Privacidade"),
+            ("#participarFidelidade", "Participar Fidelidade"),
+            ("#regulamentoFidelidade", "Regulamento Fidelidade"),
+        ]
 
-        # politicaPrivacidade
-        politica_cb = page.locator("#politicaPrivacidade")
-        if await politica_cb.count() > 0:
-            is_checked = await politica_cb.is_checked()
-            if not is_checked:
-                await politica_cb.click(force=True)
-                await asyncio.sleep(0.2)
-
-        # participarFidelidade (marcar se existir)
-        participar_cb = page.locator("#participarFidelidade")
-        if await participar_cb.count() > 0:
-            is_checked = await participar_cb.is_checked()
-            if not is_checked:
-                await participar_cb.click(force=True)
-                await asyncio.sleep(0.2)
-
-        # regulamentoFidelidade (marcar se existir)
-        regulamento_cb = page.locator("#regulamentoFidelidade")
-        if await regulamento_cb.count() > 0:
-            is_checked = await regulamento_cb.is_checked()
-            if not is_checked:
-                await regulamento_cb.click(force=True)
-                await asyncio.sleep(0.2)
+        for cb_selector, cb_name in checkboxes:
+            try:
+                cb_count = await page.locator(cb_selector).count()
+                if cb_count > 0:
+                    is_checked = await page.locator(cb_selector).is_checked()
+                    if not is_checked:
+                        await safe_click(page, cb_selector, force=True, scroll=True)
+                        debug_pw_element(cb_selector, "check", cb_name)
+                    else:
+                        debug_pw_element(cb_selector, "already_checked", cb_name)
+                    await asyncio.sleep(0.2)
+            except Exception as e:
+                debug_pw_error(f"checkbox({cb_selector})", str(e))
 
         log("OK", "Checkboxes marcados!")
         await screenshot_debug(page, "04_checkboxes_ok")
 
         # =============================================
-        # PASSO 6: Resolver reCAPTCHA Enterprise e Enviar
+        # PASSO 6: Resolver reCAPTCHA Enterprise (OHMYCAPTCHA)
         # =============================================
-        log("CAPTCHA", "Executando reCAPTCHA Enterprise via browser...")
+        captcha_token = await resolver_recaptcha_enterprise(page, action="signup")
 
-        # Executar grecaptcha.enterprise.execute() no contexto do browser
-        # Isso gera um token REAL que o servidor aceita
-        captcha_token = await page.evaluate("""
-            () => {
-                return new Promise((resolve, reject) => {
-                    try {
-                        grecaptcha.enterprise.ready(() => {
-                            grecaptcha.enterprise.execute(
-                                '""" + RECAPTCHA_SITE_KEY + """',
-                                {action: 'signup'}
-                            ).then(token => {
-                                resolve(token);
-                            }).catch(err => {
-                                reject(err.toString());
-                            });
-                        });
-                    } catch(e) {
-                        reject(e.toString());
-                    }
-                });
-            }
-        """)
-
-        if not captcha_token or len(captcha_token) < 50:
-            log("FAIL", f"reCAPTCHA Enterprise falhou! Token: {captcha_token}")
+        if not captcha_token:
+            log("FAIL", "reCAPTCHA Enterprise falhou!")
             await screenshot_debug(page, "05_captcha_fail")
             await page.close()
             return False
-
-        log("OK", f"reCAPTCHA Enterprise RESOLVIDO! ({len(captcha_token)} chars)")
-        debug_event("reCAPTCHA Enterprise token", f"{len(captcha_token)} chars")
-
-        # Injetar token no formulário (campo hidden g-recaptcha-response)
-        await page.evaluate(f"""
-            () => {{
-                // Criar ou atualizar campo hidden g-recaptcha-response
-                let existing = document.querySelector('input[name="g-recaptcha-response"]') ||
-                               document.querySelector('textarea[name="g-recaptcha-response"]');
-                if (!existing) {{
-                    existing = document.createElement('input');
-                    existing.type = 'hidden';
-                    existing.name = 'g-recaptcha-response';
-                    document.getElementById('formCadastro').appendChild(existing);
-                }}
-                existing.value = `{captcha_token}`;
-            }}
-        """)
-
-        log("OK", "Token reCAPTCHA injetado no formulario!")
 
         # =============================================
         # PASSO 7: Clicar em ENVIAR
         # =============================================
         log("STEP", "PASSO 6: Enviando cadastro...")
-
         await screenshot_debug(page, "05_pre_submit")
 
+        # Scroll até o botão de enviar
+        await safe_scroll_to(page, "#btnEnviaDados")
+        await asyncio.sleep(0.5)
+
         # Interceptar a resposta do POST
-        async with page.expect_navigation(
-            wait_until="networkidle",
-            timeout=30000
-        ) as navigation:
-            await page.locator("#btnEnviaDados").click()
+        try:
+            async with page.expect_navigation(
+                wait_until="domcontentloaded",
+                timeout=NAVIGATION_TIMEOUT
+            ) as navigation:
+                await page.locator("#btnEnviaDados").click(force=True, timeout=ELEMENT_TIMEOUT)
+                debug_pw_action("submit_click", "Clicou em #btnEnviaDados")
+        except Exception as e:
+            log("WARN", f"Navigation apos submit: {str(e)}")
+            debug_pw_error("submit_navigation", str(e))
 
         # Verificar resultado
-        await asyncio.sleep(2)
+        await asyncio.sleep(3)
         current_url = page.url
         page_content = await page.content()
 
+        debug_pw_navigation(current_url, status="post-submit")
         await screenshot_debug(page, "06_post_submit")
 
+        # Log do conteúdo pós-submit
+        debug_pw_html(await page.title(), current_url, page_content[:5000])
+
         # Verificar sucesso
-        if "Cadastro efetuado com sucesso" in page_content:
-            log("OK", "CADASTRO EFETUADO COM SUCESSO! (mensagem detectada)")
-            STATS["cadastros_ok"] += 1
-            await page.close()
-            return True
+        success_indicators = [
+            "Cadastro efetuado com sucesso",
+            "Bem vindo a Movida",
+            "Bem-vindo",
+            "receber um e-mail para confirmar",
+            "confirmar seu cadastro",
+        ]
 
-        if "Bem vindo a Movida" in page_content or "Bem-vindo" in page_content:
-            log("OK", "CADASTRO EFETUADO COM SUCESSO! (boas-vindas detectada)")
-            STATS["cadastros_ok"] += 1
-            await page.close()
-            return True
-
-        if "receber um e-mail para confirmar" in page_content.lower():
-            log("OK", "CADASTRO EFETUADO COM SUCESSO! (confirmação email detectada)")
-            STATS["cadastros_ok"] += 1
-            await page.close()
-            return True
+        for indicator in success_indicators:
+            if indicator.lower() in page_content.lower():
+                log("OK", f"CADASTRO EFETUADO COM SUCESSO! ('{indicator}' detectado)")
+                STATS["cadastros_ok"] += 1
+                await page.close()
+                return True
 
         # Verificar se ainda está no formulário (falha)
         if 'name="senha_cadastro"' in page_content or 'id="formCadastro"' in page_content:
-            # Verificar se tem mensagem de erro
             error_msgs = re.findall(
                 r'(?:toastr\[.*?\]|toastr\.(?:error|warning))\s*\(\s*["\']([^"\']+)',
                 page_content
             )
-            if error_msgs:
-                for msg in error_msgs:
-                    log("FAIL", f"  Erro JS: {msg[:200]}")
-            else:
-                # Verificar mensagens de erro no HTML
-                errors = re.findall(
-                    r'class="[^"]*(?:error|alert-danger|text-danger)[^"]*"[^>]*>(.*?)<',
-                    page_content, re.IGNORECASE
-                )
-                for err in errors:
-                    clean = re.sub(r'<[^>]+>', '', err).strip()
-                    if clean:
-                        log("FAIL", f"  Erro HTML: {clean[:200]}")
+            html_errors = re.findall(
+                r'class="[^"]*(?:error|alert-danger|text-danger)[^"]*"[^>]*>(.*?)<',
+                page_content, re.IGNORECASE
+            )
 
-            log("FAIL", "Cadastro FALHOU - formulario retornado")
+            for msg in error_msgs:
+                log("FAIL", f"  Erro JS: {msg[:200]}")
+            for err in html_errors:
+                clean = re.sub(r'<[^>]+>', '', err).strip()
+                if clean:
+                    log("FAIL", f"  Erro HTML: {clean[:200]}")
+
+            if not error_msgs and not html_errors:
+                log("FAIL", "Cadastro FALHOU - formulario retornado sem mensagem de erro visivel")
+
             await page.close()
             return False
 
@@ -434,7 +724,7 @@ async def fazer_cadastro_playwright(context, pessoa, email, senha):
 
     except Exception as e:
         log("FAIL", f"Erro no cadastro Playwright: {str(e)}")
-        debug_error(f"Cadastro Playwright: {str(e)}", traceback.format_exc())
+        debug_pw_error("cadastro_main", str(e), traceback.format_exc())
         await screenshot_debug(page, "error_cadastro")
         try:
             await page.close()
@@ -449,20 +739,20 @@ async def fazer_cadastro_playwright(context, pessoa, email, senha):
 
 async def ativar_conta_playwright(context, confirmation_link, senha):
     """Ativa a conta seguindo o link de confirmação via Playwright."""
-    log("STEP", "PASSO 7: Ativando conta via link de confirmacao...")
-    debug_event("Ativacao iniciada", f"Link: {confirmation_link}")
+    log("STEP", "Ativando conta via link de confirmacao...")
+    debug_pw_action("ativacao_start", f"Link: {confirmation_link[:100]}...")
 
     page = await context.new_page()
-    page.set_default_timeout(PAGE_LOAD_TIMEOUT)
+    page.set_default_timeout(ELEMENT_TIMEOUT)
 
     try:
-        # Seguir o link de confirmação (pode ser SendGrid redirect)
-        log("DEBUG", f"Navegando para link de confirmacao...")
-        await page.goto(confirmation_link, wait_until="networkidle", timeout=30000)
-        await asyncio.sleep(2)
+        debug_pw_navigation(confirmation_link, wait_until="domcontentloaded")
+        await page.goto(confirmation_link, wait_until="domcontentloaded", timeout=NAVIGATION_TIMEOUT)
+        await asyncio.sleep(3)
 
         final_url = page.url
         log("OK", f"URL final: {final_url[:100]}...")
+        debug_pw_navigation(final_url, status="loaded")
         await screenshot_debug(page, "07_ativacao_page")
 
         page_content = await page.content()
@@ -473,6 +763,7 @@ async def ativar_conta_playwright(context, confirmation_link, senha):
         if id_match:
             pessoa_id = id_match.group(1)
             log("OK", f"PessoaID extraido da URL: {pessoa_id}")
+            debug_pw_action("pessoa_id_from_url", pessoa_id)
 
         if not pessoa_id:
             id_patterns = [
@@ -486,29 +777,31 @@ async def ativar_conta_playwright(context, confirmation_link, senha):
                 if match:
                     pessoa_id = match.group(1)
                     log("OK", f"PessoaID extraido do HTML: {pessoa_id}")
+                    debug_pw_action("pessoa_id_from_html", pessoa_id)
                     break
 
-        # Verificar se tem formulário de senha na página
         has_password_form = 'name="senha"' in page_content or 'confirmar_senha' in page_content
 
         if has_password_form and pessoa_id:
-            log("STEP", "PASSO 8: Definindo senha via formulario...")
+            log("STEP", "Definindo senha via formulario...")
+            debug_pw_action("password_form_detected", f"PessoaID: {pessoa_id}")
 
-            # Preencher senha via Playwright
             senha_field = page.locator('input[name="senha"], input[id="senha"]').first
             if await senha_field.count() > 0:
                 await senha_field.fill(senha)
+                debug_pw_element('input[name="senha"]', "fill", "***")
                 await asyncio.sleep(0.3)
 
             confirma_field = page.locator('input[name="confirmar_senha"], input[id="confirmar_senha"]').first
             if await confirma_field.count() > 0:
                 await confirma_field.fill(senha)
+                debug_pw_element('input[name="confirmar_senha"]', "fill", "***")
                 await asyncio.sleep(0.3)
 
-            # Submeter
             submit_btn = page.locator('button[type="submit"], input[type="submit"]').first
             if await submit_btn.count() > 0:
                 await submit_btn.click()
+                debug_pw_action("password_submit", "Clicou submit")
                 await asyncio.sleep(2)
 
             log("OK", "Senha definida via formulario!")
@@ -517,12 +810,12 @@ async def ativar_conta_playwright(context, confirmation_link, senha):
             return True
 
         elif pessoa_id:
-            # POST atualizar-senha via API (fallback)
-            log("STEP", "PASSO 8: Definindo senha via API atualizar-senha...")
+            log("STEP", "Definindo senha via API atualizar-senha...")
+            debug_pw_action("api_password_fallback", f"PessoaID: {pessoa_id}")
+
             session = requests.Session()
             session.headers.update({"User-Agent": USER_AGENT_WEBVIEW})
 
-            # Copiar cookies do Playwright para requests
             cookies = await context.cookies()
             for cookie in cookies:
                 session.cookies.set(cookie["name"], cookie["value"], domain=cookie.get("domain", ""))
@@ -541,7 +834,10 @@ async def ativar_conta_playwright(context, confirmation_link, senha):
                 "Accept": "application/json, text/javascript, */*; q=0.01",
             }
 
+            debug_request("POST", atualizar_url, atualizar_headers, atualizar_data)
             resp = session.post(atualizar_url, data=atualizar_data, headers=atualizar_headers, timeout=15)
+            debug_response(atualizar_url, resp.status_code, dict(resp.headers), resp.text[:500], "atualizar-senha")
+
             log("API", f"atualizar-senha -> HTTP {resp.status_code}", resp.text[:300])
 
             if resp.status_code == 200:
@@ -563,7 +859,6 @@ async def ativar_conta_playwright(context, confirmation_link, senha):
                 except json.JSONDecodeError:
                     pass
 
-        # Se chegou aqui, verificar se a página indica sucesso
         if any(x in page_content.lower() for x in ["sucesso", "ativada", "confirmada", "login"]):
             log("OK", "Ativacao aparentemente OK!")
             STATS["ativacoes_ok"] += 1
@@ -573,11 +868,11 @@ async def ativar_conta_playwright(context, confirmation_link, senha):
         log("WARN", "Ativacao incerta, tentando login mesmo assim...")
         STATS["ativacoes_fail"] += 1
         await page.close()
-        return True  # Retorna True para tentar login
+        return True
 
     except Exception as e:
         log("FAIL", f"Erro na ativacao: {str(e)}")
-        debug_error(f"Ativacao: {str(e)}", traceback.format_exc())
+        debug_pw_error("ativacao_main", str(e), traceback.format_exc())
         try:
             await page.close()
         except Exception:
@@ -591,83 +886,107 @@ async def ativar_conta_playwright(context, confirmation_link, senha):
 # ==============================================================================
 
 async def fazer_login_playwright(context, cpf_numeros, senha):
-    """Realiza login na Movida via Playwright."""
-    log("STEP", "PASSO 9: Fazendo login na Movida...")
+    """Realiza login na Movida via Playwright. V7.2: Debug completo + ohmycaptcha."""
+    log("STEP", "Fazendo login na Movida...")
+    debug_pw_action("login_start", f"CPF: {cpf_numeros}")
 
     page = await context.new_page()
-    page.set_default_timeout(PAGE_LOAD_TIMEOUT)
+    page.set_default_timeout(ELEMENT_TIMEOUT)
 
     try:
-        # Carregar página de login
-        await page.goto(LOGIN_URL, wait_until="networkidle", timeout=NAVIGATION_TIMEOUT)
-        await asyncio.sleep(2)
+        debug_pw_navigation(LOGIN_URL, wait_until="domcontentloaded")
+        await page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=NAVIGATION_TIMEOUT)
+        await asyncio.sleep(3)
 
         await screenshot_debug(page, "08_login_page")
 
         # Preencher CPF
-        cpf_input = page.locator('input[placeholder="CPF"], input#mat-input-0, input[formcontrolname="cpf"]').first
-        await cpf_input.click()
-        await cpf_input.fill("")
-        await cpf_input.type(cpf_numeros, delay=random_delay())
+        cpf_selectors = [
+            'input[placeholder="CPF"]',
+            'input#mat-input-0',
+            'input[formcontrolname="cpf"]',
+            'input[type="text"]',
+        ]
+        cpf_filled = False
+        for sel in cpf_selectors:
+            try:
+                count = await page.locator(sel).count()
+                if count > 0:
+                    await safe_fill(page, sel, cpf_numeros, use_type=True)
+                    cpf_filled = True
+                    break
+            except Exception:
+                continue
+
+        if not cpf_filled:
+            log("FAIL", "Nao encontrou campo de CPF no login!")
+            debug_pw_error("login_cpf", "Nenhum seletor de CPF encontrado")
+            await screenshot_debug(page, "error_login_no_cpf")
+            await page.close()
+            return None, "no_cpf_field"
+
         await asyncio.sleep(0.5)
 
         # Preencher Senha
-        senha_input = page.locator('input[placeholder="Senha"], input#mat-input-1, input[formcontrolname="senha"]').first
-        await senha_input.click()
-        await senha_input.fill("")
-        await senha_input.type(senha, delay=random_delay())
-        await asyncio.sleep(0.5)
+        senha_selectors = [
+            'input[placeholder="Senha"]',
+            'input#mat-input-1',
+            'input[formcontrolname="senha"]',
+            'input[type="password"]',
+        ]
+        senha_filled = False
+        for sel in senha_selectors:
+            try:
+                count = await page.locator(sel).count()
+                if count > 0:
+                    await safe_fill(page, sel, senha, use_type=True)
+                    senha_filled = True
+                    break
+            except Exception:
+                continue
 
+        if not senha_filled:
+            log("FAIL", "Nao encontrou campo de Senha no login!")
+            debug_pw_error("login_senha", "Nenhum seletor de senha encontrado")
+            await screenshot_debug(page, "error_login_no_senha")
+            await page.close()
+            return None, "no_senha_field"
+
+        await asyncio.sleep(0.5)
         await screenshot_debug(page, "09_login_filled")
 
-        # Resolver reCAPTCHA se necessário
-        has_recaptcha = await page.evaluate("""
-            () => typeof grecaptcha !== 'undefined' && typeof grecaptcha.enterprise !== 'undefined'
-        """)
-
-        captcha_token = None
-        if has_recaptcha:
-            log("CAPTCHA", "Resolvendo reCAPTCHA Enterprise para login...")
-            try:
-                captcha_token = await page.evaluate("""
-                    () => {
-                        return new Promise((resolve, reject) => {
-                            grecaptcha.enterprise.ready(() => {
-                                grecaptcha.enterprise.execute(
-                                    '""" + RECAPTCHA_SITE_KEY + """',
-                                    {action: 'login'}
-                                ).then(token => resolve(token))
-                                .catch(err => reject(err.toString()));
-                            });
-                        });
-                    }
-                """)
-                if captcha_token and len(captcha_token) > 50:
-                    log("OK", f"reCAPTCHA login resolvido! ({len(captcha_token)} chars)")
-            except Exception as e:
-                log("WARN", f"reCAPTCHA login falhou: {str(e)}")
+        # Resolver reCAPTCHA Enterprise para login (ohmycaptcha method)
+        captcha_token = await resolver_recaptcha_enterprise(page, action="login")
+        if captcha_token:
+            log("OK", f"reCAPTCHA login resolvido! ({len(captcha_token)} chars)")
+        else:
+            log("WARN", "reCAPTCHA login falhou, tentando login sem token...")
 
         # Clicar em Entrar
         login_btn = page.locator('button:has-text("Entrar")').first
-        
+        debug_pw_action("login_click", "Clicando em Entrar")
+
         # Interceptar resposta de login
         response_promise = page.wait_for_response(
             lambda r: "login_site" in r.url or "login" in r.url,
             timeout=15000
         )
 
-        await login_btn.click()
-        
+        await login_btn.click(timeout=ELEMENT_TIMEOUT)
+
         try:
             response = await response_promise
             resp_text = await response.text()
             resp_status = response.status
-            
+
+            debug_response(response.url, resp_status, None, resp_text[:1000], "login_response")
             log("API", f"login -> HTTP {resp_status}", resp_text[:300])
 
             if resp_status == 200:
                 try:
                     data = json.loads(resp_text)
+                    debug_event("login_response_json", json.dumps(data, ensure_ascii=False)[:500])
+
                     if data.get("success"):
                         user_token = data.get("token", "")
                         user_id = data.get("user_id", "")
@@ -680,7 +999,6 @@ async def fazer_login_playwright(context, cpf_numeros, senha):
                             await page.close()
                             return user_token, "ok"
 
-                        # Tentar webcheckin/token
                         wc_token = await extrair_token_webcheckin(context, data.get("token", ""))
                         if wc_token:
                             STATS["logins_ok"] += 1
@@ -693,6 +1011,7 @@ async def fazer_login_playwright(context, cpf_numeros, senha):
                     else:
                         msg = data.get("msg", "").lower()
                         log("WARN", f"Login falhou: {data.get('msg', '?')}")
+                        debug_event("login_fail_msg", data.get("msg", "?"))
 
                         if "confirmado" in msg or "confirmar" in msg:
                             await page.close()
@@ -706,21 +1025,21 @@ async def fazer_login_playwright(context, cpf_numeros, senha):
                         await page.close()
                         return None, "unknown_error"
                 except json.JSONDecodeError:
-                    pass
+                    debug_pw_error("login_json_parse", f"Nao e JSON: {resp_text[:200]}")
         except Exception as e:
             log("DEBUG", f"Timeout esperando resposta de login: {str(e)}")
+            debug_pw_error("login_response_wait", str(e))
 
-        # Fallback: verificar se a página mudou (login via redirect)
+        # Fallback: verificar se a página mudou
         await asyncio.sleep(3)
         current_url = page.url
         page_content = await page.content()
 
+        debug_pw_navigation(current_url, status="post-login")
         await screenshot_debug(page, "10_post_login")
 
-        # Verificar se logou com sucesso
         if "minha-conta" in current_url or "dashboard" in current_url:
             log("OK", "Login OK via redirect!")
-            # Tentar extrair token da página
             token_match = re.search(r'"token"\s*:\s*"([^"]+)"', page_content)
             if token_match:
                 user_token = token_match.group(1)
@@ -735,7 +1054,7 @@ async def fazer_login_playwright(context, cpf_numeros, senha):
 
     except Exception as e:
         log("FAIL", f"Erro no login: {str(e)}")
-        debug_error(f"Login: {str(e)}", traceback.format_exc())
+        debug_pw_error("login_main", str(e), traceback.format_exc())
         try:
             await page.close()
         except Exception:
@@ -753,6 +1072,8 @@ async def extrair_token_webcheckin(context, grant_token):
         return None
 
     log("STEP", "Extraindo user-token via webcheckin/token...")
+    debug_pw_action("webcheckin_start", f"Grant token: {grant_token[:30]}...")
+
     try:
         url_token = f"{BFF_BASE}/api/v1/webcheckin/token"
         token_data = {"_token": grant_token}
@@ -765,7 +1086,10 @@ async def extrair_token_webcheckin(context, grant_token):
             "X-Requested-With": "com.netsky.vfat.pro",
         }
 
+        debug_request("POST", url_token, token_headers, token_data)
         resp = requests.post(url_token, json=token_data, headers=token_headers, timeout=15)
+        debug_response(url_token, resp.status_code, dict(resp.headers), resp.text[:500], "webcheckin/token")
+
         log("API", f"webcheckin/token -> HTTP {resp.status_code}", resp.text[:300])
 
         if resp.status_code == 200:
@@ -773,10 +1097,12 @@ async def extrair_token_webcheckin(context, grant_token):
             if not data.get("error") and data.get("data", {}).get("token"):
                 user_token = data["data"]["token"]
                 log("TOKEN", f"USER-TOKEN EXTRAIDO! {user_token[:20]}...{user_token[-10:]}")
+                debug_event("webcheckin_token_ok", f"Token: {user_token[:40]}...")
                 return user_token
         return None
     except Exception as e:
         log("FAIL", f"Erro webcheckin/token: {str(e)}")
+        debug_pw_error("webcheckin", str(e), traceback.format_exc())
         return None
 
 
@@ -787,6 +1113,7 @@ async def extrair_token_webcheckin(context, grant_token):
 async def recuperar_senha(context, emailnator, cpf_numeros, email, nova_senha):
     """Recuperação de senha via API + email."""
     log("STEP", "RECUPERACAO DE SENHA: Iniciando fluxo...")
+    debug_pw_action("recuperacao_start", f"CPF: {cpf_numeros}")
     STATS["senhas_recuperadas"] += 1
 
     try:
@@ -799,7 +1126,10 @@ async def recuperar_senha(context, emailnator, cpf_numeros, email, nova_senha):
             "User-Agent": USER_AGENT_WEBVIEW,
         }
 
+        debug_request("POST", url_recuperar, recuperar_headers, recuperar_data)
         resp = requests.post(url_recuperar, json=recuperar_data, headers=recuperar_headers, timeout=15)
+        debug_response(url_recuperar, resp.status_code, dict(resp.headers), resp.text[:500], "recuperar-senha")
+
         log("API", f"recuperar-senha -> HTTP {resp.status_code}", resp.text[:300])
 
         if resp.status_code == 200:
@@ -813,16 +1143,15 @@ async def recuperar_senha(context, emailnator, cpf_numeros, email, nova_senha):
             log("FAIL", f"recuperar-senha HTTP {resp.status_code}")
             return False
 
-        # Aguardar email de recuperação
         from config import EMAIL_RECOVER_TIMEOUT
-        link = emailnator.wait_for_email(
+        link = await emailnator.wait_for_email_async(
             sender_filter="movida",
             timeout=EMAIL_RECOVER_TIMEOUT,
             link_pattern="redefinir-senha"
         )
 
         if not link:
-            link = emailnator.wait_for_email(
+            link = await emailnator.wait_for_email_async(
                 sender_filter="movida",
                 timeout=20,
                 link_pattern="sendgrid"
@@ -837,15 +1166,5 @@ async def recuperar_senha(context, emailnator, cpf_numeros, email, nova_senha):
 
     except Exception as e:
         log("FAIL", f"Erro na recuperacao: {str(e)}")
-        debug_error(f"Recuperacao: {str(e)}", traceback.format_exc())
+        debug_pw_error("recuperacao_main", str(e), traceback.format_exc())
         return False
-
-
-# ==============================================================================
-# UTILITÁRIOS
-# ==============================================================================
-
-def random_delay():
-    """Delay aleatório para simular digitação humana (ms)."""
-    import random
-    return random.randint(30, 80)

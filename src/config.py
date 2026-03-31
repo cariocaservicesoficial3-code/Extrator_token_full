@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-AJATO TOKEN GENERATOR V7.0 - PLAYWRIGHT EDITION
+AJATO TOKEN GENERATOR V7.1 - PLAYWRIGHT EDITION
 Configurações centralizadas.
 """
 
@@ -22,11 +22,20 @@ if IS_NETHUNTER:
 else:
     BASE_DIR = os.path.join(os.path.expanduser("~"), "ajato_tokens")
 
-OUTPUT_FILE = os.path.join(BASE_DIR, "tokenschkfull.txt")
-DEBUG_LOG_FILE = os.path.join(BASE_DIR, "DEBUG_LOGS_GEN_TOKENS.txt")
+# Diretórios principais
+LOGS_DIR = os.path.join(BASE_DIR, "logs")
 SCREENSHOTS_DIR = os.path.join(BASE_DIR, "screenshots")
 
+# Arquivos
+OUTPUT_FILE = os.path.join(BASE_DIR, "tokenschkfull.txt")
+DEBUG_LOG_FILE = os.path.join(LOGS_DIR, "DEBUG_LOGS_GEN_TOKENS.txt")
+PW_LOG_FILE = os.path.join(LOGS_DIR, "PLAYWRIGHT_DEBUG.txt")
+HTTP_LOG_FILE = os.path.join(LOGS_DIR, "HTTP_REQUESTS.txt")
+CYCLE_LOG_FILE = os.path.join(LOGS_DIR, "CYCLE_HISTORY.txt")
+
+# Criar todos os diretórios
 os.makedirs(BASE_DIR, exist_ok=True)
+os.makedirs(LOGS_DIR, exist_ok=True)
 os.makedirs(SCREENSHOTS_DIR, exist_ok=True)
 
 # ==============================================================================
@@ -45,14 +54,12 @@ RECAPTCHA_SITE_KEY = "6LeHBDAmAAAAAO1dMLM3aW7knyUDFzByq8Z8WI9E"
 # ==============================================================================
 # USER-AGENTS (do HAR real que funcionou)
 # ==============================================================================
-# User-Agent do WebView Android que deu sucesso no HAR
 USER_AGENT_WEBVIEW = (
     "Mozilla/5.0 (Linux; Android 11; M2012K11AG Build/RQ3A.211001.001) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 "
     "Chrome/147.0.7727.24 Mobile Safari/537.36"
 )
 
-# User-Agent para Emailnator (Chrome desktop)
 EMAILNATOR_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
@@ -61,19 +68,23 @@ EMAILNATOR_UA = (
 # ==============================================================================
 # TIMEOUTS E DELAYS
 # ==============================================================================
-EMAIL_CONFIRM_TIMEOUT = 120      # Timeout para email de confirmação (segundos)
-EMAIL_POLL_FAST = 2              # Poll rápido nos primeiros 30s
-EMAIL_POLL_SLOW = 4              # Poll lento depois de 30s
-EMAIL_FAST_PHASE = 30            # Duração da fase rápida
-EMAIL_RECOVER_TIMEOUT = 60       # Timeout para email de recuperação
-MAX_LOGIN_RETRIES = 3            # Tentativas de login
-MAX_CADASTRO_RETRIES = 3         # Tentativas de cadastro
-MAX_RECOVER_RETRIES = 2          # Tentativas de recuperação de senha
-ACTIVATION_DELAY = 3             # Delay entre ativação e login
-MAX_REACTIVATION_ATTEMPTS = 2    # Tentativas de reativação
-MAX_INBOX_RETRIES = 3            # Retries para get_messages()
-PAGE_LOAD_TIMEOUT = 30000        # Timeout para carregamento de página (ms)
-NAVIGATION_TIMEOUT = 30000       # Timeout para navegação (ms)
+EMAIL_CONFIRM_TIMEOUT = 120
+EMAIL_POLL_FAST = 2
+EMAIL_POLL_SLOW = 4
+EMAIL_FAST_PHASE = 30
+EMAIL_RECOVER_TIMEOUT = 60
+MAX_LOGIN_RETRIES = 3
+MAX_CADASTRO_RETRIES = 3
+MAX_RECOVER_RETRIES = 2
+ACTIVATION_DELAY = 3
+MAX_REACTIVATION_ATTEMPTS = 2
+MAX_INBOX_RETRIES = 3
+
+# Playwright timeouts (AUMENTADOS para NetHunter)
+PAGE_LOAD_TIMEOUT = 60000        # 60s para carregar página
+NAVIGATION_TIMEOUT = 60000       # 60s para navegação
+ELEMENT_TIMEOUT = 30000          # 30s para encontrar elementos
+RECAPTCHA_TIMEOUT = 30000        # 30s para reCAPTCHA
 
 # ==============================================================================
 # EMAILNATOR
@@ -83,7 +94,6 @@ EMAIL_TYPES_PRIORITY = ["dotGmail", "plusGmail", "googleMail"]
 # ==============================================================================
 # PLAYWRIGHT - OTIMIZAÇÕES NETHUNTER
 # ==============================================================================
-# Argumentos do Chromium otimizados para ARM64/NetHunter
 CHROMIUM_ARGS = [
     "--no-sandbox",
     "--disable-setuid-sandbox",
@@ -115,7 +125,6 @@ CHROMIUM_ARGS = [
     "--disable-blink-features=AutomationControlled",
 ]
 
-# Viewport mobile (simula Android WebView)
 VIEWPORT = {"width": 412, "height": 915}
 
 # ==============================================================================
