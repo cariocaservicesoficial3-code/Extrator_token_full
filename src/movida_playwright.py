@@ -58,23 +58,80 @@ from pessoa_generator import get_cidade_ibge
 # Se nenhum estiver carregado, INJETA o script do Google e tenta novamente.
 _RECAPTCHA_EXECUTE_JS = """
 ([key, action]) => new Promise((resolve, reject) => {
-    const gr = window.grecaptcha?.enterprise || window.grecaptcha;
-    if (gr && typeof gr.execute === 'function') {
-        gr.ready(() => {
-            gr.execute(key, {action}).then(resolve).catch(reject);
-        });
+    // Timeout interno de 20s para NUNCA travar
+    const timer = setTimeout(() => reject(new Error('reCAPTCHA timeout interno (20s)')), 20000);
+
+    function tryExecute(gr) {
+        if (gr && typeof gr.execute === 'function') {
+            try {
+                gr.ready(() => {
+                    gr.execute(key, {action}).then(token => {
+                        clearTimeout(timer);
+                        resolve(token);
+                    }).catch(err => {
+                        clearTimeout(timer);
+                        reject(err);
+                    });
+                });
+            } catch(e) {
+                clearTimeout(timer);
+                reject(e);
+            }
+            return true;
+        }
+        return false;
+    }
+
+    // Tentar grecaptcha.enterprise primeiro, depois grecaptcha padrão
+    const ent = window.grecaptcha && window.grecaptcha.enterprise;
+    const std = window.grecaptcha;
+    if (tryExecute(ent) || tryExecute(std)) return;
+
+    // Não encontrou - verificar se o script já está sendo carregado
+    const existingScript = document.querySelector('script[src*="recaptcha/enterprise.js"]') ||
+                           document.querySelector('script[src*="recaptcha/api.js"]');
+    if (existingScript) {
+        // Script existe mas ainda não carregou - polling a cada 500ms
+        let polls = 0;
+        const pollInterval = setInterval(() => {
+            polls++;
+            const g = (window.grecaptcha && window.grecaptcha.enterprise) || window.grecaptcha;
+            if (tryExecute(g)) {
+                clearInterval(pollInterval);
+                return;
+            }
+            if (polls >= 30) { // 15s max polling
+                clearInterval(pollInterval);
+                clearTimeout(timer);
+                reject(new Error('reCAPTCHA script existe mas nunca carregou (15s polling)'));
+            }
+        }, 500);
         return;
     }
-    // grecaptcha not loaded yet — inject the script ourselves
+
+    // Script não existe - injetar
     const script = document.createElement('script');
     script.src = 'https://www.google.com/recaptcha/enterprise.js?render=' + key;
-    script.onerror = () => reject(new Error('Failed to load reCAPTCHA Enterprise script'));
+    script.onerror = () => {
+        clearTimeout(timer);
+        reject(new Error('Falha ao carregar script reCAPTCHA Enterprise'));
+    };
     script.onload = () => {
-        const g = window.grecaptcha?.enterprise || window.grecaptcha;
-        if (!g) { reject(new Error('grecaptcha still undefined after script load')); return; }
-        g.ready(() => {
-            g.execute(key, {action}).then(resolve).catch(reject);
-        });
+        // Polling após load pois grecaptcha pode demorar a inicializar
+        let polls = 0;
+        const pollInterval = setInterval(() => {
+            polls++;
+            const g = (window.grecaptcha && window.grecaptcha.enterprise) || window.grecaptcha;
+            if (tryExecute(g)) {
+                clearInterval(pollInterval);
+                return;
+            }
+            if (polls >= 20) { // 10s max após load
+                clearInterval(pollInterval);
+                clearTimeout(timer);
+                reject(new Error('grecaptcha undefined mesmo apos script.onload (10s)'));
+            }
+        }, 500);
     };
     document.head.appendChild(script);
 })
@@ -280,11 +337,14 @@ async def screenshot_debug(page, name):
 async def resolver_recaptcha_enterprise(page, action="signup"):
     """
     Resolve reCAPTCHA Enterprise usando técnicas do ohmycaptcha.
+    V7.3: Corrigido bug de hang infinito.
+    
     1. Simula mouse humano (melhora score)
-    2. Aguarda grecaptcha carregar
-    3. Usa JS universal com fallback de injeção
-    4. Valida token
-    5. Injeta no formulário
+    2. Aguarda grecaptcha carregar (polling robusto)
+    3. Usa JS universal com timeout interno de 20s
+    4. asyncio.wait_for() para NUNCA travar o Python
+    5. Valida token (len > 20)
+    6. Injeta no formulário
     """
     log("CAPTCHA", "Resolvendo reCAPTCHA Enterprise (ohmycaptcha method)...")
     debug_pw_action("recaptcha_start", f"Action: {action}, SiteKey: {RECAPTCHA_SITE_KEY}")
@@ -292,28 +352,79 @@ async def resolver_recaptcha_enterprise(page, action="signup"):
     # 1. Simular comportamento humano (melhora score do reCAPTCHA)
     await simulate_human_mouse(page)
 
-    # 2. Aguardar reCAPTCHA carregar
+    # 2. Aguardar reCAPTCHA carregar com verificação mais robusta
+    recaptcha_ready = False
+    
+    # Método 1: Verificar via JS se grecaptcha.enterprise existe
     try:
-        await page.wait_for_function(
-            "(typeof grecaptcha !== 'undefined' && typeof grecaptcha.execute === 'function') "
-            "|| (typeof grecaptcha !== 'undefined' && typeof grecaptcha?.enterprise?.execute === 'function')",
-            timeout=RECAPTCHA_TIMEOUT
-        )
-        log("OK", "reCAPTCHA Enterprise detectado na pagina!")
-        debug_pw_js_eval("recaptcha_detect", "loaded", success=True)
-    except Exception:
-        log("WARN", "reCAPTCHA nao detectado, JS universal vai tentar injetar...")
-        debug_pw_action("recaptcha_not_found", "Will attempt script injection via _EXECUTE_JS")
+        check_js = """
+        () => {
+            if (window.grecaptcha && window.grecaptcha.enterprise && 
+                typeof window.grecaptcha.enterprise.execute === 'function') return 'enterprise';
+            if (window.grecaptcha && typeof window.grecaptcha.execute === 'function') return 'standard';
+            return null;
+        }
+        """
+        result = await page.evaluate(check_js)
+        if result:
+            recaptcha_ready = True
+            log("OK", f"reCAPTCHA {result} detectado na pagina!")
+            debug_pw_js_eval("recaptcha_detect", f"type={result}", success=True)
+    except Exception as e:
+        debug_pw_error("recaptcha_check_initial", str(e))
 
-    # 3. Executar JS universal (com retry - técnica ohmycaptcha)
+    # Método 2: Se não encontrou, verificar se o script existe e fazer polling
+    if not recaptcha_ready:
+        log("DEBUG", "reCAPTCHA nao pronto, verificando se script existe na pagina...")
+        try:
+            script_exists = await page.evaluate("""
+                () => {
+                    const scripts = document.querySelectorAll('script[src*="recaptcha"]');
+                    return scripts.length > 0 ? Array.from(scripts).map(s => s.src).join(', ') : null;
+                }
+            """)
+            if script_exists:
+                log("DEBUG", f"Script reCAPTCHA encontrado: {script_exists[:100]}")
+                debug_pw_action("recaptcha_script_found", script_exists[:100])
+                # Polling por até 15s esperando carregar
+                for i in range(30):
+                    await asyncio.sleep(0.5)
+                    check = await page.evaluate("""
+                        () => {
+                            if (window.grecaptcha && window.grecaptcha.enterprise && 
+                                typeof window.grecaptcha.enterprise.execute === 'function') return 'enterprise';
+                            if (window.grecaptcha && typeof window.grecaptcha.execute === 'function') return 'standard';
+                            return null;
+                        }
+                    """)
+                    if check:
+                        recaptcha_ready = True
+                        log("OK", f"reCAPTCHA {check} carregou apos {(i+1)*0.5:.1f}s de polling!")
+                        debug_pw_js_eval("recaptcha_polling_ok", f"type={check}, polls={i+1}", success=True)
+                        break
+            else:
+                log("WARN", "Nenhum script reCAPTCHA encontrado na pagina!")
+                debug_pw_action("recaptcha_no_script", "Will inject via JS universal")
+        except Exception as e:
+            debug_pw_error("recaptcha_polling", str(e))
+
+    if not recaptcha_ready:
+        log("WARN", "reCAPTCHA nao carregou, JS universal vai injetar o script...")
+        debug_pw_action("recaptcha_will_inject", "Fallback injection")
+
+    # 3. Executar JS universal (com retry + asyncio.wait_for para NUNCA travar)
     captcha_token = None
     last_error = None
 
     for attempt in range(3):
         try:
-            captcha_token = await page.evaluate(
-                _RECAPTCHA_EXECUTE_JS,
-                [RECAPTCHA_SITE_KEY, action]
+            # asyncio.wait_for garante que NUNCA trava mais que 25s
+            captcha_token = await asyncio.wait_for(
+                page.evaluate(
+                    _RECAPTCHA_EXECUTE_JS,
+                    [RECAPTCHA_SITE_KEY, action]
+                ),
+                timeout=25.0
             )
 
             if isinstance(captcha_token, str) and len(captcha_token) > 20:
@@ -325,9 +436,16 @@ async def resolver_recaptcha_enterprise(page, action="signup"):
                 debug_pw_error("recaptcha_execute", f"Attempt {attempt+1}: {last_error}")
                 captcha_token = None
 
+        except asyncio.TimeoutError:
+            last_error = f"asyncio.wait_for timeout (25s) na tentativa {attempt+1}"
+            log("WARN", f"reCAPTCHA tentativa {attempt+1}/3: TIMEOUT Python (25s)")
+            debug_pw_error("recaptcha_execute", f"Attempt {attempt+1}: {last_error}")
+            if attempt < 2:
+                await asyncio.sleep(2)
+
         except Exception as e:
             last_error = str(e)
-            log("WARN", f"reCAPTCHA tentativa {attempt+1}/3 falhou: {last_error}")
+            log("WARN", f"reCAPTCHA tentativa {attempt+1}/3 falhou: {last_error[:100]}")
             debug_pw_error("recaptcha_execute", f"Attempt {attempt+1}: {last_error}")
             if attempt < 2:
                 await asyncio.sleep(2)
