@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-AJATO TOKEN GENERATOR V7.2 - Módulo Movida Playwright
+AJATO TOKEN GENERATOR V7.4 - Módulo Movida Playwright
 Cadastro, ativação e login via Playwright (navegador headless real).
 
-INTEGRAÇÃO OHMYCAPTCHA (shenhao-stu/ohmycaptcha):
-  - JS universal para reCAPTCHA v3/Enterprise com fallback de injeção
-  - Stealth JS melhorado (window.chrome, navigator.plugins)
-  - Mouse movement humano antes do reCAPTCHA (melhora score)
-  - Retry robusto com validação de token
+V7.4 - HYBRID reCAPTCHA SOLVER:
+  - Método 1: Tenta grecaptcha.enterprise.execute no browser (JS nativo)
+  - Método 2: HTTP bypass puro (GET anchor + POST reload) do V6.1
+  - Método 3: Injeção do token HTTP no DOM do Playwright
+  - Resolve o problema do Google bloquear reCAPTCHA em headless
 
-CORREÇÕES V7.2:
-  - Timeouts aumentados (60s) para NetHunter
-  - Scroll automático antes de clicar em elementos fora do viewport
-  - wait_until="domcontentloaded" ao invés de "networkidle" (mais rápido)
-  - force=True + JS click fallback em radio/checkbox
-  - Debug completo de cada ação do Playwright
+INTEGRAÇÕES:
+  - OhMyCaptcha: Stealth JS, mouse humano, anti-detecção
+  - V6.1: HTTP bypass enterprise/anchor + reload
+  - Playwright: Preenchimento de formulário + submissão
+  - Debug completo de cada ação
 """
 
 import re
@@ -32,7 +31,8 @@ from urllib.parse import urlencode
 from config import (
     MOVIDA_BASE, BFF_BASE, CADASTRO_URL, LOGIN_URL,
     ENVIAR_CADASTRO_URL, LOGIN_SITE_URL,
-    RECAPTCHA_SITE_KEY, USER_AGENT_WEBVIEW,
+    RECAPTCHA_SITE_KEY, RECAPTCHA_CO, RECAPTCHA_V,
+    USER_AGENT_WEBVIEW,
     CHROMIUM_ARGS, VIEWPORT, SCREENSHOTS_DIR,
     PAGE_LOAD_TIMEOUT, NAVIGATION_TIMEOUT,
     ELEMENT_TIMEOUT, RECAPTCHA_TIMEOUT,
@@ -331,31 +331,156 @@ async def screenshot_debug(page, name):
 
 
 # ==============================================================================
-# RESOLVER reCAPTCHA ENTERPRISE (INTEGRAÇÃO OHMYCAPTCHA)
+# RESOLVER reCAPTCHA ENTERPRISE - ABORDAGEM HÍBRIDA V7.4
 # ==============================================================================
 
-async def resolver_recaptcha_enterprise(page, action="signup"):
+def _solve_recaptcha_http(action="signup"):
     """
-    Resolve reCAPTCHA Enterprise usando técnicas do ohmycaptcha.
-    V7.3: Corrigido bug de hang infinito.
+    Resolve reCAPTCHA Enterprise via HTTP puro (bypass do V6.1).
+    Funciona mesmo quando o Google bloqueia grecaptcha no headless.
     
-    1. Simula mouse humano (melhora score)
-    2. Aguarda grecaptcha carregar (polling robusto)
-    3. Usa JS universal com timeout interno de 20s
-    4. asyncio.wait_for() para NUNCA travar o Python
-    5. Valida token (len > 20)
-    6. Injeta no formulário
+    Fluxo:
+    1. GET /recaptcha/enterprise/anchor -> extrai c-token
+    2. POST /recaptcha/enterprise/reload -> extrai rresp token
+    3. Fallback para /recaptcha/api2/ se enterprise falhar
     """
-    log("CAPTCHA", "Resolvendo reCAPTCHA Enterprise (ohmycaptcha method)...")
-    debug_pw_action("recaptcha_start", f"Action: {action}, SiteKey: {RECAPTCHA_SITE_KEY}")
+    log("CAPTCHA", f"[HTTP] Resolvendo reCAPTCHA via HTTP bypass (action='{action}')...")
+    debug_pw_action("recaptcha_http_start", f"action={action}, key={RECAPTCHA_SITE_KEY[:15]}...")
 
-    # 1. Simular comportamento humano (melhora score do reCAPTCHA)
-    await simulate_human_mouse(page)
+    anchor_params = {
+        "ar": "1",
+        "k": RECAPTCHA_SITE_KEY,
+        "co": RECAPTCHA_CO,
+        "hl": "pt-BR",
+        "v": RECAPTCHA_V,
+        "size": "invisible",
+    }
 
-    # 2. Aguardar reCAPTCHA carregar com verificação mais robusta
-    recaptcha_ready = False
-    
-    # Método 1: Verificar via JS se grecaptcha.enterprise existe
+    endpoints = ["enterprise", "api2"]
+
+    for attempt in range(3):
+        for endpoint in endpoints:
+            try:
+                anchor_url = f"https://www.google.com/recaptcha/{endpoint}/anchor?{urlencode(anchor_params)}"
+                log("CAPTCHA", f"  [{endpoint}] Tentativa {attempt+1}/3 - GET anchor...")
+                debug_request("GET", anchor_url)
+
+                cap_session = requests.Session()
+                cap_session.headers.update({
+                    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+                })
+
+                res_anchor = cap_session.get(anchor_url, timeout=15)
+                debug_response(anchor_url, res_anchor.status_code, None, res_anchor.text[:1500], f"recaptcha_anchor_{endpoint}")
+
+                if res_anchor.status_code != 200:
+                    log("WARN", f"  [{endpoint}] Anchor HTTP {res_anchor.status_code}")
+                    continue
+
+                # Extrair c-token
+                c_token_match = re.search(r'id="recaptcha-token"\s*value="(.*?)"', res_anchor.text)
+                if not c_token_match:
+                    c_token_match = re.search(r'recaptcha-token.*?value="(.*?)"', res_anchor.text)
+
+                if not c_token_match:
+                    log("FAIL", f"  [{endpoint}] c-token nao encontrado no anchor")
+                    debug_event("c-token not found", f"Response snippet: {res_anchor.text[:500]}")
+                    continue
+
+                c_token = c_token_match.group(1)
+                log("CAPTCHA", f"  [{endpoint}] c-token obtido ({len(c_token)} chars)")
+
+                # POST reload
+                reload_data = {
+                    "v": RECAPTCHA_V,
+                    "reason": "q",
+                    "c": c_token,
+                    "k": RECAPTCHA_SITE_KEY,
+                    "co": RECAPTCHA_CO,
+                    "hl": "pt-BR",
+                    "size": "invisible",
+                    "chr": "",
+                    "vh": "",
+                    "bg": "",
+                }
+
+                reload_url = f"https://www.google.com/recaptcha/{endpoint}/reload?k={RECAPTCHA_SITE_KEY}"
+                reload_headers = {
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Referer": f"https://www.google.com/recaptcha/{endpoint}/anchor?{urlencode(anchor_params)}",
+                }
+
+                log("CAPTCHA", f"  [{endpoint}] POST reload (form-urlencoded)...")
+                debug_request("POST", reload_url, reload_headers, reload_data)
+
+                res_reload = cap_session.post(
+                    reload_url,
+                    data=urlencode(reload_data),
+                    headers=reload_headers,
+                    timeout=15
+                )
+                debug_response(reload_url, res_reload.status_code, None, res_reload.text[:3000], f"recaptcha_reload_{endpoint}")
+
+                if res_reload.status_code != 200:
+                    log("WARN", f"  [{endpoint}] Reload HTTP {res_reload.status_code}")
+                    continue
+
+                # Extrair token - Método 1: regex rresp
+                rresp_match = re.findall(r'"rresp","(.*?)"', res_reload.text)
+                if rresp_match and rresp_match[0]:
+                    token = rresp_match[0]
+                    log("OK", f"  [{endpoint}] reCAPTCHA HTTP RESOLVIDO! ({len(token)} chars)")
+                    debug_event("reCAPTCHA HTTP solved", f"endpoint={endpoint}, token_length={len(token)}")
+                    return token
+
+                # Método 2: JSON parse
+                try:
+                    text = res_reload.text
+                    json_start = text.find('[')
+                    if json_start >= 0:
+                        json_data = json.loads(text[json_start:])
+                        if isinstance(json_data, list) and len(json_data) > 1 and json_data[1]:
+                            token = str(json_data[1])
+                            if len(token) > 50:
+                                log("OK", f"  [{endpoint}] reCAPTCHA HTTP RESOLVIDO via JSON! ({len(token)} chars)")
+                                debug_event("reCAPTCHA HTTP solved (JSON)", f"endpoint={endpoint}, token_length={len(token)}")
+                                return token
+                except (json.JSONDecodeError, IndexError, TypeError):
+                    pass
+
+                if '"rresp",null' in res_reload.text or '"rresp", null' in res_reload.text:
+                    log("WARN", f"  [{endpoint}] rresp=null (token nao gerado)")
+                    debug_event(f"rresp=null on {endpoint}", res_reload.text[:500])
+                else:
+                    log("WARN", f"  [{endpoint}] Resposta inesperada do reload")
+                    debug_event(f"Unexpected reload response on {endpoint}", res_reload.text[:500])
+
+            except Exception as e:
+                log("FAIL", f"  [{endpoint}] Erro HTTP: {str(e)}")
+                debug_error(f"reCAPTCHA HTTP {endpoint}: {str(e)}", traceback.format_exc())
+
+        # Delay progressivo entre tentativas
+        if attempt < 2:
+            delay = (attempt + 1) * 2
+            log("WARN", f"  Aguardando {delay}s antes da proxima tentativa HTTP...")
+            time.sleep(delay)
+
+    log("FAIL", "[HTTP] reCAPTCHA HTTP FALHOU apos todas as tentativas!")
+    return None
+
+
+async def _solve_recaptcha_browser(page, action="signup"):
+    """
+    Tenta resolver reCAPTCHA Enterprise via browser (JS nativo).
+    Pode falhar se o Google detectar headless.
+    Timeout máximo: 15s (rápido, para não atrasar o fallback HTTP).
+    """
+    log("CAPTCHA", "[BROWSER] Tentando resolver reCAPTCHA via JS nativo...")
+    debug_pw_action("recaptcha_browser_start", f"action={action}")
+
+    # Verificar se grecaptcha está disponível
     try:
         check_js = """
         () => {
@@ -366,114 +491,135 @@ async def resolver_recaptcha_enterprise(page, action="signup"):
         }
         """
         result = await page.evaluate(check_js)
-        if result:
-            recaptcha_ready = True
-            log("OK", f"reCAPTCHA {result} detectado na pagina!")
-            debug_pw_js_eval("recaptcha_detect", f"type={result}", success=True)
+        if not result:
+            # Polling rápido (5s máx)
+            for i in range(10):
+                await asyncio.sleep(0.5)
+                result = await page.evaluate(check_js)
+                if result:
+                    break
+
+        if not result:
+            log("WARN", "[BROWSER] grecaptcha nao disponivel no browser")
+            debug_pw_action("recaptcha_browser_unavailable", "grecaptcha not found")
+            return None
+
+        log("OK", f"[BROWSER] grecaptcha.{result} detectado!")
+        debug_pw_js_eval("recaptcha_browser_detect", f"type={result}", success=True)
+
     except Exception as e:
-        debug_pw_error("recaptcha_check_initial", str(e))
-
-    # Método 2: Se não encontrou, verificar se o script existe e fazer polling
-    if not recaptcha_ready:
-        log("DEBUG", "reCAPTCHA nao pronto, verificando se script existe na pagina...")
-        try:
-            script_exists = await page.evaluate("""
-                () => {
-                    const scripts = document.querySelectorAll('script[src*="recaptcha"]');
-                    return scripts.length > 0 ? Array.from(scripts).map(s => s.src).join(', ') : null;
-                }
-            """)
-            if script_exists:
-                log("DEBUG", f"Script reCAPTCHA encontrado: {script_exists[:100]}")
-                debug_pw_action("recaptcha_script_found", script_exists[:100])
-                # Polling por até 15s esperando carregar
-                for i in range(30):
-                    await asyncio.sleep(0.5)
-                    check = await page.evaluate("""
-                        () => {
-                            if (window.grecaptcha && window.grecaptcha.enterprise && 
-                                typeof window.grecaptcha.enterprise.execute === 'function') return 'enterprise';
-                            if (window.grecaptcha && typeof window.grecaptcha.execute === 'function') return 'standard';
-                            return null;
-                        }
-                    """)
-                    if check:
-                        recaptcha_ready = True
-                        log("OK", f"reCAPTCHA {check} carregou apos {(i+1)*0.5:.1f}s de polling!")
-                        debug_pw_js_eval("recaptcha_polling_ok", f"type={check}, polls={i+1}", success=True)
-                        break
-            else:
-                log("WARN", "Nenhum script reCAPTCHA encontrado na pagina!")
-                debug_pw_action("recaptcha_no_script", "Will inject via JS universal")
-        except Exception as e:
-            debug_pw_error("recaptcha_polling", str(e))
-
-    if not recaptcha_ready:
-        log("WARN", "reCAPTCHA nao carregou, JS universal vai injetar o script...")
-        debug_pw_action("recaptcha_will_inject", "Fallback injection")
-
-    # 3. Executar JS universal (com retry + asyncio.wait_for para NUNCA travar)
-    captcha_token = None
-    last_error = None
-
-    for attempt in range(3):
-        try:
-            # asyncio.wait_for garante que NUNCA trava mais que 25s
-            captcha_token = await asyncio.wait_for(
-                page.evaluate(
-                    _RECAPTCHA_EXECUTE_JS,
-                    [RECAPTCHA_SITE_KEY, action]
-                ),
-                timeout=25.0
-            )
-
-            if isinstance(captcha_token, str) and len(captcha_token) > 20:
-                log("OK", f"reCAPTCHA Enterprise RESOLVIDO! ({len(captcha_token)} chars) [tentativa {attempt+1}]")
-                debug_pw_js_eval("recaptcha_execute", f"Token: {len(captcha_token)} chars, attempt: {attempt+1}", success=True)
-                break
-            else:
-                last_error = f"Token invalido: {captcha_token!r}"
-                debug_pw_error("recaptcha_execute", f"Attempt {attempt+1}: {last_error}")
-                captcha_token = None
-
-        except asyncio.TimeoutError:
-            last_error = f"asyncio.wait_for timeout (25s) na tentativa {attempt+1}"
-            log("WARN", f"reCAPTCHA tentativa {attempt+1}/3: TIMEOUT Python (25s)")
-            debug_pw_error("recaptcha_execute", f"Attempt {attempt+1}: {last_error}")
-            if attempt < 2:
-                await asyncio.sleep(2)
-
-        except Exception as e:
-            last_error = str(e)
-            log("WARN", f"reCAPTCHA tentativa {attempt+1}/3 falhou: {last_error[:100]}")
-            debug_pw_error("recaptcha_execute", f"Attempt {attempt+1}: {last_error}")
-            if attempt < 2:
-                await asyncio.sleep(2)
-
-    if not captcha_token:
-        log("FAIL", f"reCAPTCHA Enterprise falhou apos 3 tentativas! Ultimo erro: {last_error}")
+        debug_pw_error("recaptcha_browser_check", str(e))
         return None
 
-    # 4. Injetar token no formulário
+    # Tentar executar (timeout curto de 15s)
     try:
+        captcha_token = await asyncio.wait_for(
+            page.evaluate(
+                _RECAPTCHA_EXECUTE_JS,
+                [RECAPTCHA_SITE_KEY, action]
+            ),
+            timeout=15.0
+        )
+
+        if isinstance(captcha_token, str) and len(captcha_token) > 20:
+            log("OK", f"[BROWSER] reCAPTCHA RESOLVIDO via JS! ({len(captcha_token)} chars)")
+            debug_pw_js_eval("recaptcha_browser_ok", f"Token: {len(captcha_token)} chars", success=True)
+            return captcha_token
+        else:
+            log("WARN", f"[BROWSER] Token invalido: {captcha_token!r}")
+            return None
+
+    except asyncio.TimeoutError:
+        log("WARN", "[BROWSER] Timeout 15s - grecaptcha nao respondeu")
+        debug_pw_error("recaptcha_browser_timeout", "15s timeout")
+        return None
+    except Exception as e:
+        log("WARN", f"[BROWSER] Erro: {str(e)[:100]}")
+        debug_pw_error("recaptcha_browser_error", str(e))
+        return None
+
+
+async def resolver_recaptcha_enterprise(page, action="signup"):
+    """
+    Resolver reCAPTCHA Enterprise - ABORDAGEM HÍBRIDA V7.4.
+    
+    Estratégia:
+    1. Simula mouse humano (melhora score)
+    2. Tenta resolver via browser JS (rápido, 15s timeout)
+    3. Se falhar, usa HTTP bypass puro do V6.1 (sempre funciona)
+    4. Injeta o token no DOM do Playwright
+    """
+    log("CAPTCHA", "="*60)
+    log("CAPTCHA", "RESOLVENDO reCAPTCHA Enterprise (HIBRIDO V7.4)")
+    log("CAPTCHA", f"  Action: {action} | SiteKey: {RECAPTCHA_SITE_KEY[:20]}...")
+    log("CAPTCHA", "="*60)
+    debug_pw_action("recaptcha_hybrid_start", f"action={action}")
+
+    # 1. Simular comportamento humano (melhora score)
+    await simulate_human_mouse(page)
+
+    captcha_token = None
+
+    # ==========================================
+    # MÉTODO 1: Tentar via Browser JS (rápido)
+    # ==========================================
+    log("CAPTCHA", "[1/2] Tentando resolver via Browser JS...")
+    captcha_token = await _solve_recaptcha_browser(page, action)
+
+    if captcha_token:
+        log("OK", f"reCAPTCHA resolvido via BROWSER! ({len(captcha_token)} chars)")
+    else:
+        # ==========================================
+        # MÉTODO 2: HTTP Bypass (V6.1 - sempre funciona)
+        # ==========================================
+        log("CAPTCHA", "[2/2] Browser falhou, usando HTTP bypass (V6.1)...")
+        captcha_token = _solve_recaptcha_http(action)
+
+        if captcha_token:
+            log("OK", f"reCAPTCHA resolvido via HTTP BYPASS! ({len(captcha_token)} chars)")
+        else:
+            log("FAIL", "reCAPTCHA FALHOU em AMBOS os métodos!")
+            debug_pw_error("recaptcha_hybrid_fail", "Both browser and HTTP methods failed")
+            return None
+
+    # ==========================================
+    # INJETAR TOKEN NO DOM DO PLAYWRIGHT
+    # ==========================================
+    try:
+        # Escapar o token para uso seguro no JS
+        safe_token = captcha_token.replace('\\', '\\\\').replace('`', '\\`').replace('$', '\\$')
         await page.evaluate(f"""
             () => {{
-                let existing = document.querySelector('input[name="g-recaptcha-response"]') ||
-                               document.querySelector('textarea[name="g-recaptcha-response"]') ||
-                               document.querySelector('textarea.g-recaptcha-response');
+                // Procurar campo existente
+                let existing = document.querySelector('textarea[name="g-recaptcha-response"]')
+                    || document.querySelector('input[name="g-recaptcha-response"]')
+                    || document.querySelector('textarea.g-recaptcha-response')
+                    || document.querySelector('#g-recaptcha-response');
+                
                 if (!existing) {{
+                    // Criar campo hidden no formulário
                     existing = document.createElement('textarea');
                     existing.name = 'g-recaptcha-response';
+                    existing.id = 'g-recaptcha-response';
                     existing.style.display = 'none';
                     const form = document.getElementById('formCadastro') || document.forms[0];
                     if (form) form.appendChild(existing);
+                    else document.body.appendChild(existing);
                 }}
-                existing.value = `{captcha_token}`;
+                existing.value = `{safe_token}`;
+                
+                // Também setar em todos os textareas de reCAPTCHA (pode haver múltiplos)
+                document.querySelectorAll('textarea[name="g-recaptcha-response"]').forEach(el => {{
+                    el.value = `{safe_token}`;
+                }});
             }}
         """)
+        log("OK", f"Token injetado no DOM! ({len(captcha_token)} chars)")
         debug_pw_action("inject_captcha_token", f"Injetado {len(captcha_token)} chars no form")
     except Exception as e:
+        log("WARN", f"Erro ao injetar token no DOM: {str(e)[:100]}")
         debug_pw_error("inject_captcha_token", str(e))
+        # Não retorna None aqui - o token ainda pode funcionar via submit
 
     return captcha_token
 

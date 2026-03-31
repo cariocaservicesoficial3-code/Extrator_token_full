@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-AJATO TOKEN GENERATOR V7.1 - PLAYWRIGHT EDITION
+AJATO TOKEN GENERATOR V7.4 - PLAYWRIGHT + HYBRID reCAPTCHA
 Configurações centralizadas.
 """
 
@@ -50,6 +50,10 @@ LOGIN_SITE_URL = f"{MOVIDA_BASE}/login_site"
 
 # reCAPTCHA Enterprise config (extraído do HAR real)
 RECAPTCHA_SITE_KEY = "6LeHBDAmAAAAAO1dMLM3aW7knyUDFzByq8Z8WI9E"
+
+# reCAPTCHA HTTP bypass (V6.1 - funciona quando headless é bloqueado)
+RECAPTCHA_CO = "aHR0cHM6Ly93d3cubW92aWRhLmNvbS5icjo0NDM."
+RECAPTCHA_V = "qm3PSRIx10pekcnS9DjGnjPW"
 
 # ==============================================================================
 # USER-AGENTS (do HAR real que funcionou)
