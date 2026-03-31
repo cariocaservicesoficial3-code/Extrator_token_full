@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Logs e tokens (dados sensíveis)
+*.txt
+!requirements.txt
+!README.md
+
+# Screenshots de debug
+screenshots/
+
+# HAR files (dados sensíveis)
+*.har
+
+# Ambiente virtual
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
