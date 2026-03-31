@@ -2,9 +2,9 @@
 # -*- coding: utf-8 -*-
 """
 ╔══════════════════════════════════════════════════════════════╗
-║     AJATO TOKEN GENERATOR V7.2 - PLAYWRIGHT EDITION         ║
-║     Refatorado com Playwright para Kali Linux NetHunter      ║
-║     Integração OhMyCaptcha + Debug Logs Completo + ZIP       ║
+║     AJATO TOKEN GENERATOR V7.4 - HYBRID reCAPTCHA           ║
+║     Playwright + HTTP Bypass + OhMyCaptcha Stealth           ║
+║     Otimizado para Kali Linux NetHunter                      ║
 ╚══════════════════════════════════════════════════════════════╝
 
 Fluxo principal:
@@ -18,10 +18,10 @@ Fluxo principal:
   8. Salvar token no arquivo
   9. Criar ZIP com logs + screenshots do ciclo
 
-NOVIDADES V7.2:
-  - Integração OhMyCaptcha (JS universal, stealth, mouse humano)
-  - Debug logs completo em /sdcard/nh_files/logs/
-  - ZIP automático por ciclo e sessão
+NOVIDADES V7.4:
+  - reCAPTCHA Híbrido: Browser JS (15s) + HTTP Bypass V6.1 (sempre funciona)
+  - Integração OhMyCaptcha (stealth JS, mouse humano, anti-detecção)
+  - Debug logs completo em /sdcard/nh_files/logs/ com ZIP automático
   - Correções de timeout/scroll para NetHunter
 """
 
@@ -75,9 +75,9 @@ def print_banner():
 ║{C.CY}   | | | || |_| | | | | | | \\ \\_/ /                            {C.MG}║
 ║{C.CY}   \\_| |_/ \\___/\\_| |_/ \\_/  \\___/                             {C.MG}║
 ║                                                              ║
-║{C.G}   TOKEN GENERATOR V7.2 - PLAYWRIGHT + OHMYCAPTCHA          {C.MG}║
+║{C.G}   TOKEN GENERATOR V7.4 - PLAYWRIGHT + HYBRID reCAPTCHA          {C.MG}║
 ║{C.Y}   Otimizado para Kali Linux NetHunter                       {C.MG}║
-║{C.CY}   reCAPTCHA Enterprise via Browser Real                     {C.MG}║
+║{C.CY}   reCAPTCHA: Browser JS + HTTP Bypass V6.1                     {C.MG}║
 ║{C.W}   Debug Logs + ZIP em /sdcard/nh_files/logs/               {C.MG}║
 ╚══════════════════════════════════════════════════════════════╝{C.R}
 """)
