@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 """
 ╔══════════════════════════════════════════════════════════════╗
-║     AJATO TOKEN GENERATOR V7.5 - SMART RETRY + AJAX SUBMIT    ║
-║     Playwright + HTTP Bypass + Smart CPF Retry                 ║
+║     AJATO TOKEN GENERATOR V7.6 - HTTP DIRECT SUBMIT        ║
+║     Playwright + HTTP POST Direto + Smart CPF Retry            ║
 ║     Otimizado para Kali Linux NetHunter                      ║
 ╚══════════════════════════════════════════════════════════════╝
 
@@ -18,11 +18,12 @@ Fluxo principal:
   8. Salvar token no arquivo
   9. Criar ZIP com logs + screenshots do ciclo
 
-NOVIDADES V7.5:
-  - reCAPTCHA Híbrido: Browser JS (15s) + HTTP Bypass V6.1 (sempre funciona)
-  - SMART RETRY: Detecta 'CPF duplicado' e gera novo CPF automaticamente
-  - AJAX SUBMIT: Espera resposta AJAX (10s) ao invés de navegação (60s)
-  - Detecção inteligente de erros (filtra templates JS)
+NOVIDADES V7.6:
+  - HTTP DIRECT SUBMIT: POST HTTP direto ao invés de clicar no botão ENVIAR
+  - Resolve o problema do grecaptcha.enterprise não carregar no headless
+  - Extrai cookies do Playwright + campos do formulário via JS
+  - Faz POST para /usuario/enviar-cadastro com token reCAPTCHA HTTP
+  - Detecção precisa: HTTP 303=sucesso, verifica corpo para erros
   - Debug logs completo em /sdcard/nh_files/logs/ com ZIP automático
 """
 
@@ -76,7 +77,7 @@ def print_banner():
 ║{C.CY}   | | | || |_| | | | | | | \\ \\_/ /                            {C.MG}║
 ║{C.CY}   \\_| |_/ \\___/\\_| |_/ \\_/  \\___/                             {C.MG}║
 ║                                                              ║
-║{C.G}   TOKEN GENERATOR V7.5 - SMART RETRY + AJAX SUBMIT          {C.MG}║
+║{C.G}   TOKEN GENERATOR V7.6 - HTTP DIRECT SUBMIT          {C.MG}║
 ║{C.Y}   Otimizado para Kali Linux NetHunter                       {C.MG}║
 ║{C.CY}   Smart CPF Retry + AJAX Submit + HTTP reCAPTCHA Bypass                     {C.MG}║
 ║{C.W}   Debug Logs + ZIP em /sdcard/nh_files/logs/               {C.MG}║
@@ -200,7 +201,7 @@ async def executar_ciclo(cycle_num, playwright):
         log("OK", f"Senha gerada: {C.Y}{senha}{C.R}")
 
         # =============================================
-        # PASSO 4-6: Cadastro via Playwright (V7.5 Smart Retry)
+        # PASSO 4-6: Cadastro via Playwright (V7.6 HTTP Direct Submit)
         # =============================================
         cadastro_status = None
         max_cpf_retries = 5  # Máximo de CPFs diferentes para tentar
@@ -213,7 +214,7 @@ async def executar_ciclo(cycle_num, playwright):
             cadastro_status = await fazer_cadastro_playwright(context, pessoa, email, senha)
             log("DEBUG", f"  Resultado cadastro: {cadastro_status}")
 
-            # V7.5: Retorno inteligente com status string
+            # V7.6: Retorno inteligente com status string
             if cadastro_status == "sucesso":
                 log("OK", f"Cadastro SUCESSO na tentativa {tentativa}!")
                 break

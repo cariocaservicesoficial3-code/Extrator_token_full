@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-AJATO TOKEN GENERATOR V7.5 - SMART RETRY + AJAX SUBMIT
+AJATO TOKEN GENERATOR V7.6 - HTTP DIRECT SUBMIT
 Configurações centralizadas.
 """
 

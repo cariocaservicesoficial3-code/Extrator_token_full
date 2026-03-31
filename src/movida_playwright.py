@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-AJATO TOKEN GENERATOR V7.5 - Módulo Movida Playwright
+AJATO TOKEN GENERATOR V7.6 - Módulo Movida Playwright
 Cadastro, ativação e login via Playwright (navegador headless real).
 
-V7.5 - SMART RETRY + AJAX SUBMIT:
-  - Método 1: Tenta grecaptcha.enterprise.execute no browser (JS nativo)
-  - Método 2: HTTP bypass puro (GET anchor + POST reload) do V6.1
-  - Método 3: Injeção do token HTTP no DOM do Playwright
-  - Resolve o problema do Google bloquear reCAPTCHA em headless
+V7.6 - HTTP DIRECT SUBMIT:
+  - Playwright preenche o formulário (visual, com screenshots)
+  - reCAPTCHA resolvido via HTTP bypass (enterprise/anchor + reload)
+  - Submit feito via POST HTTP direto (bypass do JS do formulário)
+  - Resolve o problema do grecaptcha.enterprise não carregar no headless
 
 INTEGRAÇÕES:
   - OhMyCaptcha: Stealth JS, mouse humano, anti-detecção
   - V6.1: HTTP bypass enterprise/anchor + reload
-  - Playwright: Preenchimento de formulário + submissão
+  - Playwright: Preenchimento de formulário + coleta de cookies
+  - HTTP POST direto: Submit real com cookies do Playwright
   - Debug completo de cada ação
 """
 
@@ -902,215 +903,233 @@ async def fazer_cadastro_playwright(context, pessoa, email, senha):
             return "captcha_fail"
 
         # =============================================
-        # PASSO 7: Clicar em ENVIAR (AJAX - V7.5)
+        # PASSO 7: SUBMIT HTTP DIRETO (V7.6)
+        # O JS do formulário chama grecaptcha.enterprise.execute
+        # que não funciona no headless. Então fazemos o POST
+        # HTTP diretamente usando cookies do Playwright.
         # =============================================
-        log("STEP", "PASSO 6: Enviando cadastro...")
+        log("STEP", "PASSO 6: Enviando cadastro via HTTP DIRETO (V7.6)...")
         await screenshot_debug(page, "05_pre_submit")
 
-        # Scroll até o botão de enviar
-        await safe_scroll_to(page, "#btnEnviaDados")
-        await asyncio.sleep(0.5)
+        # 1. Extrair cookies do Playwright para usar no requests
+        cookies_list = await page.context.cookies()
+        cookies_dict = {c["name"]: c["value"] for c in cookies_list}
+        debug_event("cookies_extracted", f"{len(cookies_dict)} cookies: {', '.join(cookies_dict.keys())}")
 
-        # V7.5: Submit é AJAX (não navega) - interceptar response OU esperar mudança no DOM
-        submit_response_data = None
-        try:
-            # Interceptar resposta AJAX do enviar-cadastro
-            response_promise = page.wait_for_response(
-                lambda r: "enviar-cadastro" in r.url or "cadastro" in r.url and r.request.method == "POST",
-                timeout=30000
-            )
-            await page.locator("#btnEnviaDados").click(force=True, timeout=ELEMENT_TIMEOUT)
-            debug_pw_action("submit_click", "Clicou em #btnEnviaDados (AJAX mode V7.5)")
-
-            try:
-                response = await response_promise
-                resp_text = await response.text()
-                resp_status = response.status
-                debug_response(response.url, resp_status, None, resp_text[:2000], "cadastro_submit_ajax")
-                log("API", f"cadastro-submit -> HTTP {resp_status}")
-
-                # Tentar parsear JSON
-                try:
-                    submit_response_data = json.loads(resp_text)
-                    debug_event("cadastro_ajax_json", json.dumps(submit_response_data, ensure_ascii=False)[:500])
-                except json.JSONDecodeError:
-                    log("DEBUG", f"Resposta nao e JSON: {resp_text[:200]}")
-
-                # HTTP 303 = redirect = sucesso no cadastro
-                if resp_status in (200, 303, 302, 301):
-                    log("DEBUG", f"HTTP {resp_status} recebido do submit")
-
-            except Exception as e:
-                log("DEBUG", f"Timeout esperando response AJAX: {str(e)[:100]}")
-                debug_pw_error("submit_ajax_wait", str(e))
-
-        except Exception as e:
-            # Fallback: clicar sem interceptar
-            log("WARN", f"Submit fallback (sem interceptacao): {str(e)[:80]}")
-            try:
-                await page.locator("#btnEnviaDados").click(force=True, timeout=ELEMENT_TIMEOUT)
-                debug_pw_action("submit_click_fallback", "Clicou sem interceptacao")
-            except Exception as e2:
-                debug_pw_error("submit_click_fail", str(e2))
-
-        # V7.5: Esperar resposta AJAX aparecer no DOM (max 10s ao invés de 60s)
-        log("DEBUG", "Aguardando resposta do servidor (max 10s)...")
-        for wait_i in range(20):  # 20 x 500ms = 10s
-            await asyncio.sleep(0.5)
-            try:
-                # Verificar se apareceu mensagem de sucesso ou erro
-                has_change = await page.evaluate("""
-                    () => {
-                        const body = document.body.innerText || '';
-                        if (body.includes('sucesso') || body.includes('Bem vindo') ||
-                            body.includes('confirmar') || body.includes('cadastrado') ||
-                            body.includes('Documento')) return true;
-                        // Verificar se toastr apareceu
-                        const toastr = document.querySelector('.toast-message, .toastr, #toast-container');
-                        if (toastr && toastr.innerText.trim()) return true;
-                        return false;
+        # 2. Extrair todos os campos do formulário via JS
+        form_data_js = await page.evaluate("""
+            () => {
+                const form = document.getElementById('formCadastro');
+                if (!form) return null;
+                const data = {};
+                const inputs = form.querySelectorAll('input, select, textarea');
+                for (const el of inputs) {
+                    const name = el.name || el.id;
+                    if (!name) continue;
+                    if (el.type === 'radio') {
+                        if (el.checked) data[name] = el.value;
+                    } else if (el.type === 'checkbox') {
+                        if (el.checked) data[name] = el.value || 'on';
+                    } else {
+                        data[name] = el.value || '';
                     }
-                """)
-                if has_change:
-                    log("DEBUG", f"Resposta detectada no DOM apos {(wait_i+1)*0.5:.1f}s")
-                    break
-            except Exception:
-                pass
+                }
+                return data;
+            }
+        """)
 
-        # Verificar resultado
-        current_url = page.url
-        page_content = await page.content()
-        page_text = ""
-        try:
-            page_text = await page.evaluate("() => document.body.innerText || ''")
-        except Exception:
-            pass
-
-        debug_pw_navigation(current_url, status="post-submit")
-        await screenshot_debug(page, "06_post_submit")
-        debug_pw_html(await page.title(), current_url, page_content[:5000])
-
-        # =============================================
-        # V7.5: DETECÇÃO INTELIGENTE DE RESULTADO
-        # =============================================
-
-        # 1. Verificar sucesso
-        success_indicators = [
-            "Cadastro efetuado com sucesso",
-            "Bem vindo a Movida",
-            "Bem-vindo",
-            "receber um e-mail para confirmar",
-            "confirmar seu cadastro",
-            "e-mail de confirma",
-        ]
-        combined_text = (page_content + " " + page_text).lower()
-
-        for indicator in success_indicators:
-            if indicator.lower() in combined_text:
-                log("OK", f"CADASTRO EFETUADO COM SUCESSO! ('{indicator}' detectado)")
-                STATS["cadastros_ok"] += 1
-                await page.close()
-                return "sucesso"
-
-        # 2. Verificar "Documento já cadastrado" (CPF duplicado)
-        cpf_duplicado_indicators = [
-            "documento j\u00e1 cadastrado",
-            "documento ja cadastrado",
-            "cpf j\u00e1 cadastrado",
-            "cpf ja cadastrado",
-            "j\u00e1 possui cadastro",
-            "ja possui cadastro",
-        ]
-        for indicator in cpf_duplicado_indicators:
-            if indicator in combined_text:
-                log("WARN", f"CPF DUPLICADO detectado! ('{indicator}')")
-                debug_event("cpf_duplicado", f"Indicador: {indicator}")
-                await page.close()
-                return "cpf_duplicado"
-
-        # 3. Verificar se resposta AJAX indicou erro
-        if submit_response_data and isinstance(submit_response_data, dict):
-            msg = submit_response_data.get("msg", "").lower()
-            if "documento" in msg and "cadastrado" in msg:
-                log("WARN", f"CPF DUPLICADO via AJAX: {submit_response_data.get('msg')}")
-                await page.close()
-                return "cpf_duplicado"
-            if submit_response_data.get("success") is True:
-                log("OK", "CADASTRO OK via resposta AJAX!")
-                STATS["cadastros_ok"] += 1
-                await page.close()
-                return "sucesso"
-
-        # 4. Verificar outros erros no formulário (filtrar templates JS)
-        if 'name="senha_cadastro"' in page_content or 'id="formCadastro"' in page_content:
-            # Extrair erros reais (ignorar templates JS)
-            real_errors = []
-
-            # Erros do toastr
-            error_msgs = re.findall(
-                r'(?:toastr\[.*?\]|toastr\.(?:error|warning))\s*\(\s*["\']([^"\']+)',
-                page_content
-            )
-            for msg in error_msgs:
-                # Filtrar templates JS (contêm getErro, response.msg, etc)
-                if 'getErro' not in msg and 'response.' not in msg and '+' not in msg:
-                    real_errors.append(msg)
-                    log("FAIL", f"  Erro JS: {msg[:200]}")
-
-            # Erros HTML
-            html_errors = re.findall(
-                r'class="[^"]*(?:error|alert-danger|text-danger)[^"]*"[^>]*>(.*?)<',
-                page_content, re.IGNORECASE
-            )
-            for err in html_errors:
-                clean = re.sub(r'<[^>]+>', '', err).strip()
-                # Filtrar templates JS
-                if clean and 'getErro' not in clean and 'response.' not in clean and '+' not in clean:
-                    real_errors.append(clean)
-                    log("FAIL", f"  Erro HTML: {clean[:200]}")
-
-            # Verificar se algum erro real é CPF duplicado
-            for err in real_errors:
-                if "documento" in err.lower() and "cadastrado" in err.lower():
-                    log("WARN", "CPF DUPLICADO detectado nos erros do formulario!")
-                    await page.close()
-                    return "cpf_duplicado"
-
-            # Extrair texto visível do toastr (pode ter aparecido dinamicamente)
-            try:
-                toastr_text = await page.evaluate("""
-                    () => {
-                        const msgs = document.querySelectorAll('.toast-message');
-                        return Array.from(msgs).map(m => m.innerText).join(' | ');
-                    }
-                """)
-                if toastr_text:
-                    log("DEBUG", f"Toastr visivel: {toastr_text[:200]}")
-                    if "documento" in toastr_text.lower() and "cadastrado" in toastr_text.lower():
-                        log("WARN", "CPF DUPLICADO via toastr visivel!")
-                        await page.close()
-                        return "cpf_duplicado"
-                    real_errors.append(toastr_text)
-            except Exception:
-                pass
-
-            if not real_errors:
-                log("FAIL", "Cadastro FALHOU - formulario retornado sem mensagem de erro visivel")
-
+        if not form_data_js:
+            log("FAIL", "Nao conseguiu extrair dados do formulario!")
             await page.close()
             return "erro_generico"
 
-        # 5. Se a URL mudou, provavelmente deu certo
-        if current_url != CADASTRO_URL:
-            log("OK", f"Cadastro enviado! URL mudou para: {current_url[:80]}")
-            STATS["cadastros_ok"] += 1
-            await page.close()
-            return "sucesso"
+        debug_event("form_data_extracted", f"{len(form_data_js)} campos: {json.dumps({k: v[:30] if len(str(v))>30 else v for k,v in form_data_js.items()}, ensure_ascii=False)}")
 
-        log("WARN", "Resultado do cadastro incerto, assumindo sucesso...")
-        STATS["cadastros_ok"] += 1
-        await page.close()
-        return "sucesso"
+        # 3. Injetar o token reCAPTCHA nos dados do formulário
+        form_data_js["g-recaptcha-response"] = captcha_token
+
+        # 4. Garantir campos obrigatórios do HAR (que podem faltar)
+        form_data_js.setdefault("isLoginSocial", "")
+        form_data_js.setdefault("requester", "")
+        form_data_js.setdefault("tokenRequester", "")
+        form_data_js.setdefault("partnership", "")
+        form_data_js.setdefault("user_token", "")
+        form_data_js.setdefault("nationality", "Brasileiro")
+        form_data_js.setdefault("nacionalidade", "2")
+        form_data_js.setdefault("IDNacionalidade", "1007")
+
+        # Extrair UF e cidade dos selects (que podem não estar no form_data)
+        try:
+            uf_val = await page.locator("#uf_sel").input_value()
+            form_data_js["uf"] = uf_val
+        except Exception:
+            form_data_js.setdefault("uf", pessoa.get("estado", "SP"))
+
+        try:
+            cidade_val = await page.locator("#cidade_sel").input_value()
+            form_data_js["cidade"] = cidade_val
+        except Exception:
+            form_data_js.setdefault("cidade", get_cidade_ibge(pessoa.get("cidade", "")))
+
+        # Remover campos indesejados que podem causar erro
+        for key_to_remove in ["senha_conf_visible", "senha_cadastro_visible"]:
+            form_data_js.pop(key_to_remove, None)
+
+        # 5. Fazer o POST HTTP direto
+        log("API", f"POST {ENVIAR_CADASTRO_URL}")
+        log("DEBUG", f"  Campos: {len(form_data_js)} | Token reCAPTCHA: {len(captcha_token)} chars")
+        log("DEBUG", f"  CPF: {form_data_js.get('cpf', '?')} | Nome: {form_data_js.get('nome', '?')}")
+        log("DEBUG", f"  Email: {form_data_js.get('email', '?')} | CEP: {form_data_js.get('cep', '?')}")
+
+        submit_headers = {
+            "User-Agent": USER_AGENT_WEBVIEW,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Origin": MOVIDA_BASE,
+            "Referer": CADASTRO_URL,
+            "sec-fetch-site": "same-origin",
+            "sec-fetch-mode": "navigate",
+            "sec-fetch-dest": "document",
+        }
+
+        debug_request("POST", ENVIAR_CADASTRO_URL, submit_headers,
+                      {k: v[:50] if len(str(v))>50 else v for k,v in form_data_js.items()},
+                      "cadastro_submit_http")
+
+        try:
+            submit_resp = requests.post(
+                ENVIAR_CADASTRO_URL,
+                data=form_data_js,
+                headers=submit_headers,
+                cookies=cookies_dict,
+                allow_redirects=False,
+                timeout=30
+            )
+
+            resp_status = submit_resp.status_code
+            resp_text = submit_resp.text[:3000]
+            resp_headers = dict(submit_resp.headers)
+
+            debug_response(ENVIAR_CADASTRO_URL, resp_status, resp_headers, resp_text, "cadastro_submit_http")
+            log("API", f"cadastro-submit -> HTTP {resp_status}")
+
+            # Seguir redirect se houver
+            redirect_url = submit_resp.headers.get("Location", "")
+            if redirect_url:
+                log("DEBUG", f"Redirect para: {redirect_url}")
+                debug_event("cadastro_redirect", redirect_url)
+
+            # =============================================
+            # V7.6: DETECÇÃO DE RESULTADO DO POST HTTP
+            # =============================================
+
+            # HTTP 303/302/301 = redirect = SUCESSO no cadastro!
+            if resp_status in (303, 302, 301):
+                log("OK", f"CADASTRO EFETUADO COM SUCESSO! (HTTP {resp_status} redirect)")
+                debug_event("cadastro_sucesso", f"HTTP {resp_status} -> {redirect_url}")
+                STATS["cadastros_ok"] += 1
+
+                # Seguir redirect para confirmar
+                if redirect_url:
+                    try:
+                        confirm_resp = requests.get(
+                            redirect_url if redirect_url.startswith("http") else f"{MOVIDA_BASE}{redirect_url}",
+                            headers={"User-Agent": USER_AGENT_WEBVIEW, "Referer": ENVIAR_CADASTRO_URL},
+                            cookies=cookies_dict,
+                            timeout=15
+                        )
+                        confirm_text = confirm_resp.text[:2000].lower()
+                        debug_response(redirect_url, confirm_resp.status_code, None, confirm_text[:1000], "cadastro_confirm")
+
+                        # Verificar mensagem de sucesso na página de confirmação
+                        if "sucesso" in confirm_text or "confirmar" in confirm_text or "e-mail" in confirm_text:
+                            log("OK", "Confirmacao de cadastro recebida!")
+                        elif "documento" in confirm_text and "cadastrado" in confirm_text:
+                            log("WARN", "Redirect indica CPF duplicado!")
+                            await page.close()
+                            return "cpf_duplicado"
+                    except Exception as e:
+                        debug_pw_error("confirm_redirect", str(e))
+
+                await screenshot_debug(page, "06_post_submit")
+                await page.close()
+                return "sucesso"
+
+            # HTTP 200 = pode ser sucesso ou erro (verificar corpo)
+            elif resp_status == 200:
+                resp_lower = resp_text.lower()
+
+                # Verificar sucesso no corpo
+                success_in_body = any(s in resp_lower for s in [
+                    "cadastro efetuado com sucesso",
+                    "bem vindo", "bem-vindo",
+                    "confirmar seu cadastro",
+                    "e-mail de confirma",
+                ])
+                if success_in_body:
+                    log("OK", "CADASTRO EFETUADO COM SUCESSO! (detectado no corpo HTTP 200)")
+                    STATS["cadastros_ok"] += 1
+                    await screenshot_debug(page, "06_post_submit")
+                    await page.close()
+                    return "sucesso"
+
+                # Verificar CPF duplicado no corpo
+                cpf_dup_in_body = any(s in resp_lower for s in [
+                    "documento já cadastrado", "documento ja cadastrado",
+                    "cpf já cadastrado", "cpf ja cadastrado",
+                    "já possui cadastro", "ja possui cadastro",
+                ])
+                if cpf_dup_in_body:
+                    log("WARN", "CPF DUPLICADO detectado na resposta HTTP!")
+                    debug_event("cpf_duplicado_http", resp_text[:500])
+                    await screenshot_debug(page, "06_post_submit")
+                    await page.close()
+                    return "cpf_duplicado"
+
+                # Verificar erro de validação
+                if "erro" in resp_lower or "invalid" in resp_lower:
+                    log("FAIL", f"Erro de validacao no cadastro: {resp_text[:300]}")
+                    debug_event("cadastro_erro_validacao", resp_text[:500])
+                    await screenshot_debug(page, "06_post_submit")
+                    await page.close()
+                    return "erro_generico"
+
+                # HTTP 200 sem indicadores claros - pode ser sucesso
+                log("WARN", f"HTTP 200 sem indicadores claros. Corpo: {resp_text[:200]}")
+                await screenshot_debug(page, "06_post_submit")
+                await page.close()
+                return "erro_generico"
+
+            # HTTP 4xx/5xx = erro
+            else:
+                log("FAIL", f"Cadastro falhou com HTTP {resp_status}")
+                debug_event("cadastro_http_error", f"HTTP {resp_status}: {resp_text[:500]}")
+
+                if resp_status == 422:
+                    log("FAIL", "HTTP 422 - Erro de validacao do servidor")
+                    # Tentar parsear JSON de erro
+                    try:
+                        err_json = json.loads(resp_text)
+                        log("FAIL", f"  Detalhes: {json.dumps(err_json, ensure_ascii=False)[:300]}")
+                    except Exception:
+                        pass
+
+                await screenshot_debug(page, "06_post_submit")
+                await page.close()
+                return "erro_generico"
+
+        except requests.exceptions.Timeout:
+            log("FAIL", "Timeout no POST HTTP do cadastro (30s)")
+            await screenshot_debug(page, "06_post_submit")
+            await page.close()
+            return "erro_generico"
+        except Exception as e:
+            log("FAIL", f"Erro no POST HTTP do cadastro: {str(e)}")
+            debug_pw_error("http_submit", str(e), traceback.format_exc())
+            await screenshot_debug(page, "06_post_submit")
+            await page.close()
+            return "erro_generico"
 
     except Exception as e:
         log("FAIL", f"Erro no cadastro Playwright: {str(e)}")
