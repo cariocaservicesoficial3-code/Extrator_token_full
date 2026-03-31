@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-AJATO TOKEN GENERATOR V7.6 - Módulo Movida Playwright
+AJATO TOKEN GENERATOR V7.7 - Módulo Movida Playwright
 Cadastro, ativação e login via Playwright (navegador headless real).
 
-V7.6 - HTTP DIRECT SUBMIT:
+V7.7 - HTTP DIRECT SUBMIT FIX:
+  - FIX: debug_request() chamado com 5 args (aceita max 4) - POST nunca executava
+  - FIX: Detecção de erro HTTP 200 mais específica (evita falso positivo com 'erro' genérico)
+  - FIX: Logging detalhado do response body para análise
   - Playwright preenche o formulário (visual, com screenshots)
   - reCAPTCHA resolvido via HTTP bypass (enterprise/anchor + reload)
   - Submit feito via POST HTTP direto (bypass do JS do formulário)
@@ -994,8 +997,7 @@ async def fazer_cadastro_playwright(context, pessoa, email, senha):
         }
 
         debug_request("POST", ENVIAR_CADASTRO_URL, submit_headers,
-                      {k: v[:50] if len(str(v))>50 else v for k,v in form_data_js.items()},
-                      "cadastro_submit_http")
+                      {k: v[:50] if len(str(v))>50 else v for k,v in form_data_js.items()})
 
         try:
             submit_resp = requests.post(
@@ -1087,18 +1089,39 @@ async def fazer_cadastro_playwright(context, pessoa, email, senha):
                     await page.close()
                     return "cpf_duplicado"
 
-                # Verificar erro de validação
-                if "erro" in resp_lower or "invalid" in resp_lower:
-                    log("FAIL", f"Erro de validacao no cadastro: {resp_text[:300]}")
+                # Verificar erro de validação ESPECÍFICO (não genérico)
+                error_patterns = [
+                    "erro ao cadastrar", "erro no cadastro",
+                    "campo obrigatório", "campo obrigatorio",
+                    "preencha corretamente", "dados inválidos", "dados invalidos",
+                    "recaptcha inválido", "recaptcha invalido",
+                    "token inválido", "token invalido",
+                    "invalid recaptcha", "captcha failed",
+                ]
+                error_in_body = any(s in resp_lower for s in error_patterns)
+                if error_in_body:
+                    matched = [s for s in error_patterns if s in resp_lower]
+                    log("FAIL", f"Erro de validacao no cadastro: {matched}")
+                    log("DEBUG", f"  Response body (500 chars): {resp_text[:500]}")
                     debug_event("cadastro_erro_validacao", resp_text[:500])
                     await screenshot_debug(page, "06_post_submit")
                     await page.close()
                     return "erro_generico"
 
-                # HTTP 200 sem indicadores claros - pode ser sucesso
-                log("WARN", f"HTTP 200 sem indicadores claros. Corpo: {resp_text[:200]}")
+                # HTTP 200 sem indicadores claros - logar body para análise
+                log("WARN", f"HTTP 200 sem indicadores claros")
+                log("DEBUG", f"  Response URL: {submit_resp.url}")
+                log("DEBUG", f"  Response body (primeiros 500 chars): {resp_text[:500]}")
+                log("DEBUG", f"  Response body (últimos 500 chars): {resp_text[-500:]}")
+                debug_event("cadastro_http200_unclear", resp_text[:1000])
                 await screenshot_debug(page, "06_post_submit")
                 await page.close()
+                # Não retornar erro_generico imediatamente - pode ser sucesso
+                # Se a URL mudou ou tem indicadores de sucesso parcial, considerar
+                if "/usuario/cadastro" not in str(submit_resp.url):
+                    log("OK", f"URL mudou para {submit_resp.url} - possível sucesso!")
+                    STATS["cadastros_ok"] += 1
+                    return "sucesso"
                 return "erro_generico"
 
             # HTTP 4xx/5xx = erro
