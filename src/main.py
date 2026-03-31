@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 """
 ╔══════════════════════════════════════════════════════════════╗
-║     AJATO TOKEN GENERATOR V7.4 - HYBRID reCAPTCHA           ║
-║     Playwright + HTTP Bypass + OhMyCaptcha Stealth           ║
+║     AJATO TOKEN GENERATOR V7.5 - SMART RETRY + AJAX SUBMIT    ║
+║     Playwright + HTTP Bypass + Smart CPF Retry                 ║
 ║     Otimizado para Kali Linux NetHunter                      ║
 ╚══════════════════════════════════════════════════════════════╝
 
@@ -18,11 +18,12 @@ Fluxo principal:
   8. Salvar token no arquivo
   9. Criar ZIP com logs + screenshots do ciclo
 
-NOVIDADES V7.4:
+NOVIDADES V7.5:
   - reCAPTCHA Híbrido: Browser JS (15s) + HTTP Bypass V6.1 (sempre funciona)
-  - Integração OhMyCaptcha (stealth JS, mouse humano, anti-detecção)
+  - SMART RETRY: Detecta 'CPF duplicado' e gera novo CPF automaticamente
+  - AJAX SUBMIT: Espera resposta AJAX (10s) ao invés de navegação (60s)
+  - Detecção inteligente de erros (filtra templates JS)
   - Debug logs completo em /sdcard/nh_files/logs/ com ZIP automático
-  - Correções de timeout/scroll para NetHunter
 """
 
 import os
@@ -75,9 +76,9 @@ def print_banner():
 ║{C.CY}   | | | || |_| | | | | | | \\ \\_/ /                            {C.MG}║
 ║{C.CY}   \\_| |_/ \\___/\\_| |_/ \\_/  \\___/                             {C.MG}║
 ║                                                              ║
-║{C.G}   TOKEN GENERATOR V7.4 - PLAYWRIGHT + HYBRID reCAPTCHA          {C.MG}║
+║{C.G}   TOKEN GENERATOR V7.5 - SMART RETRY + AJAX SUBMIT          {C.MG}║
 ║{C.Y}   Otimizado para Kali Linux NetHunter                       {C.MG}║
-║{C.CY}   reCAPTCHA: Browser JS + HTTP Bypass V6.1                     {C.MG}║
+║{C.CY}   Smart CPF Retry + AJAX Submit + HTTP reCAPTCHA Bypass                     {C.MG}║
 ║{C.W}   Debug Logs + ZIP em /sdcard/nh_files/logs/               {C.MG}║
 ╚══════════════════════════════════════════════════════════════╝{C.R}
 """)
@@ -199,24 +200,64 @@ async def executar_ciclo(cycle_num, playwright):
         log("OK", f"Senha gerada: {C.Y}{senha}{C.R}")
 
         # =============================================
-        # PASSO 4-6: Cadastro via Playwright
+        # PASSO 4-6: Cadastro via Playwright (V7.5 Smart Retry)
         # =============================================
-        cadastro_ok = False
+        cadastro_status = None
+        max_cpf_retries = 5  # Máximo de CPFs diferentes para tentar
+        cpf_attempt = 0
+
         for tentativa in range(1, MAX_CADASTRO_RETRIES + 1):
             log("STEP", f"PASSO 4-6: Cadastrando na Movida (tentativa {tentativa}/{MAX_CADASTRO_RETRIES})...")
+            log("DEBUG", f"  Usando CPF: {cpf} | Nome: {nome} | Email: {email}")
 
-            cadastro_ok = await fazer_cadastro_playwright(context, pessoa, email, senha)
-            if cadastro_ok:
+            cadastro_status = await fazer_cadastro_playwright(context, pessoa, email, senha)
+            log("DEBUG", f"  Resultado cadastro: {cadastro_status}")
+
+            # V7.5: Retorno inteligente com status string
+            if cadastro_status == "sucesso":
+                log("OK", f"Cadastro SUCESSO na tentativa {tentativa}!")
                 break
 
-            if tentativa < MAX_CADASTRO_RETRIES:
-                log("WARN", f"Cadastro falhou (tentativa {tentativa}). Tentando novamente...")
-                await asyncio.sleep(2)
+            elif cadastro_status == "cpf_duplicado":
+                cpf_attempt += 1
+                log("WARN", f"CPF {cpf} ja existe na Movida! (tentativa CPF #{cpf_attempt})")
 
-        if not cadastro_ok:
-            log("FAIL", f"Cadastro falhou apos {MAX_CADASTRO_RETRIES} tentativas!")
+                if cpf_attempt >= max_cpf_retries:
+                    log("FAIL", f"Esgotou {max_cpf_retries} tentativas de CPF diferente!")
+                    break
+
+                # Gerar NOVA pessoa com CPF diferente
+                log("STEP", f"Gerando NOVO CPF/pessoa (tentativa CPF #{cpf_attempt + 1})...")
+                nova_pessoa = gerar_pessoa_4devs()
+                if nova_pessoa:
+                    pessoa = nova_pessoa
+                    nome = pessoa.get("nome", "?")
+                    cpf = pessoa.get("cpf", "?")
+                    cpf_numeros = re.sub(r'\D', '', cpf)
+                    log("OK", f"Nova pessoa: {C.G}{nome}{C.R} | CPF: {cpf}")
+                    debug_event("novo_cpf", f"Tentativa #{cpf_attempt + 1}: {cpf} - {nome}")
+                    CURRENT_CYCLE.update({"cpf": cpf, "nome": nome})
+                else:
+                    log("FAIL", "Nao conseguiu gerar nova pessoa!")
+                    break
+
+                await asyncio.sleep(1)
+                continue
+
+            elif cadastro_status == "captcha_fail":
+                log("WARN", f"reCAPTCHA falhou na tentativa {tentativa}. Retentando...")
+                await asyncio.sleep(2)
+                continue
+
+            else:  # erro_generico ou qualquer outro
+                log("WARN", f"Cadastro falhou com status '{cadastro_status}' (tentativa {tentativa})")
+                if tentativa < MAX_CADASTRO_RETRIES:
+                    await asyncio.sleep(2)
+
+        if cadastro_status != "sucesso":
+            log("FAIL", f"Cadastro falhou! Status final: {cadastro_status}")
             STATS["cadastros_fail"] += 1
-            debug_session_end(cycle_num, False, error="cadastro_failed")
+            debug_session_end(cycle_num, False, error=f"cadastro_{cadastro_status}")
             await emailnator.close()
             await browser.close()
             return False
