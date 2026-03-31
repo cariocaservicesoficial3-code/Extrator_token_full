@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-AJATO TOKEN GENERATOR V7.7 - Módulo Movida Playwright
+AJATO TOKEN GENERATOR V7.8 - Módulo Movida Playwright
 Cadastro, ativação e login via Playwright (navegador headless real).
 
-V7.7 - HTTP DIRECT SUBMIT FIX:
-  - FIX: debug_request() chamado com 5 args (aceita max 4) - POST nunca executava
-  - FIX: Detecção de erro HTTP 200 mais específica (evita falso positivo com 'erro' genérico)
-  - FIX: Logging detalhado do response body para análise
+V7.8 - MODO TESTE + FIX FALSO POSITIVO:
+  - FIX CRITICO: Detecção de sucesso HTTP 200 corrigida (falso positivo eliminado)
+    * "/usuario/cadastro" NOT in "/usuario/enviar-cadastro" = True (BUG!)
+    * Agora verifica se response URL é EXATAMENTE a URL de envio (= falha)
+    * HTTP 200 com formulário de cadastro = FALHA, não sucesso
+  - FIX: Body completo logado (10000 chars) para análise detalhada
+  - FIX: allow_redirects=True para capturar redirects automaticamente
+  - FIX: Verifica se body contém o formulário (indica recarregamento = falha)
   - Playwright preenche o formulário (visual, com screenshots)
   - reCAPTCHA resolvido via HTTP bypass (enterprise/anchor + reload)
   - Submit feito via POST HTTP direto (bypass do JS do formulário)
@@ -33,7 +37,7 @@ from datetime import datetime
 from urllib.parse import urlencode
 
 from config import (
-    MOVIDA_BASE, BFF_BASE, CADASTRO_URL, LOGIN_URL,
+    C, MOVIDA_BASE, BFF_BASE, CADASTRO_URL, LOGIN_URL,
     ENVIAR_CADASTRO_URL, LOGIN_SITE_URL,
     RECAPTCHA_SITE_KEY, RECAPTCHA_CO, RECAPTCHA_V,
     USER_AGENT_WEBVIEW,
@@ -1005,72 +1009,135 @@ async def fazer_cadastro_playwright(context, pessoa, email, senha):
                 data=form_data_js,
                 headers=submit_headers,
                 cookies=cookies_dict,
-                allow_redirects=False,
+                allow_redirects=True,  # V7.8: seguir redirects automaticamente
                 timeout=30
             )
 
             resp_status = submit_resp.status_code
-            resp_text = submit_resp.text[:3000]
+            resp_text = submit_resp.text[:10000]  # V7.8: body completo para análise
             resp_headers = dict(submit_resp.headers)
+            final_url = str(submit_resp.url)
+            redirect_history = [r.status_code for r in submit_resp.history]  # V7.8: histórico de redirects
 
-            debug_response(ENVIAR_CADASTRO_URL, resp_status, resp_headers, resp_text, "cadastro_submit_http")
-            log("API", f"cadastro-submit -> HTTP {resp_status}")
+            log("DEBUG", f"  Redirect history: {redirect_history}")
+            log("DEBUG", f"  Final URL: {final_url}")
 
-            # Seguir redirect se houver
-            redirect_url = submit_resp.headers.get("Location", "")
-            if redirect_url:
-                log("DEBUG", f"Redirect para: {redirect_url}")
-                debug_event("cadastro_redirect", redirect_url)
+            debug_response(ENVIAR_CADASTRO_URL, resp_status, resp_headers, resp_text[:3000], "cadastro_submit_http")
+            log("API", f"cadastro-submit -> HTTP {resp_status} (final URL: {final_url[:100]})")
+
+            # V7.8: Verificar se houve redirect (allow_redirects=True agora)
+            redirect_url = ""
+            if redirect_history:
+                log("OK", f"Houve redirect(s): {redirect_history}")
+                redirect_url = final_url
+                debug_event("cadastro_redirect", f"history={redirect_history} -> {final_url}")
+            else:
+                log("DEBUG", "Nenhum redirect detectado")
 
             # =============================================
-            # V7.6: DETECÇÃO DE RESULTADO DO POST HTTP
+            # V7.8: DETECÇÃO DE RESULTADO DO POST HTTP
+            # (allow_redirects=True - redirects já foram seguidos)
             # =============================================
 
-            # HTTP 303/302/301 = redirect = SUCESSO no cadastro!
-            if resp_status in (303, 302, 301):
-                log("OK", f"CADASTRO EFETUADO COM SUCESSO! (HTTP {resp_status} redirect)")
-                debug_event("cadastro_sucesso", f"HTTP {resp_status} -> {redirect_url}")
+            # V7.8: Se houve redirect na history, o servidor fez 303/302
+            # Isso indica SUCESSO no cadastro!
+            if redirect_history and any(s in (301, 302, 303) for s in redirect_history):
+                log("OK", f"CADASTRO EFETUADO COM SUCESSO! (redirect {redirect_history} -> {final_url[:100]})")
+                debug_event("cadastro_sucesso", f"redirects={redirect_history} -> {final_url}")
                 STATS["cadastros_ok"] += 1
 
-                # Seguir redirect para confirmar
-                if redirect_url:
-                    try:
-                        confirm_resp = requests.get(
-                            redirect_url if redirect_url.startswith("http") else f"{MOVIDA_BASE}{redirect_url}",
-                            headers={"User-Agent": USER_AGENT_WEBVIEW, "Referer": ENVIAR_CADASTRO_URL},
-                            cookies=cookies_dict,
-                            timeout=15
-                        )
-                        confirm_text = confirm_resp.text[:2000].lower()
-                        debug_response(redirect_url, confirm_resp.status_code, None, confirm_text[:1000], "cadastro_confirm")
-
-                        # Verificar mensagem de sucesso na página de confirmação
-                        if "sucesso" in confirm_text or "confirmar" in confirm_text or "e-mail" in confirm_text:
-                            log("OK", "Confirmacao de cadastro recebida!")
-                        elif "documento" in confirm_text and "cadastrado" in confirm_text:
-                            log("WARN", "Redirect indica CPF duplicado!")
-                            await page.close()
-                            return "cpf_duplicado"
-                    except Exception as e:
-                        debug_pw_error("confirm_redirect", str(e))
+                # Verificar conteúdo da página final
+                resp_lower = resp_text.lower()
+                if "sucesso" in resp_lower or "confirmar" in resp_lower or "e-mail" in resp_lower:
+                    log("OK", "Confirmacao de cadastro detectada na pagina final!")
+                elif "documento" in resp_lower and "cadastrado" in resp_lower:
+                    log("WARN", "Redirect indica CPF duplicado!")
+                    await page.close()
+                    return "cpf_duplicado"
 
                 await screenshot_debug(page, "06_post_submit")
                 await page.close()
                 return "sucesso"
 
-            # HTTP 200 = pode ser sucesso ou erro (verificar corpo)
+            # HTTP 200 = verificar corpo para determinar resultado
             elif resp_status == 200:
                 resp_lower = resp_text.lower()
 
-                # Verificar sucesso no corpo
+                # V7.8: PRIMEIRO verificar se é o formulário de cadastro recarregado
+                # Se o body contém o formulário, o cadastro FALHOU silenciosamente
+                form_reloaded = any(s in resp_lower for s in [
+                    'id="formcadastro"',
+                    'id="btnenvia',
+                    'formcadastro',
+                    'enviadados',
+                ])
+
+                if form_reloaded:
+                    log("WARN", f"{C.BG_R}{C.W} HTTP 200 COM FORMULARIO RECARREGADO = CADASTRO FALHOU! {C.R}")
+                    log("WARN", "O servidor retornou a mesma pagina de cadastro (falha silenciosa)")
+                    log("DEBUG", f"  Final URL: {final_url}")
+                    log("DEBUG", f"  Body contem formulario: SIM")
+
+                    # Tentar encontrar mensagem de erro oculta no body
+                    # Procurar por alertas, modals, mensagens de erro
+                    error_hints = []
+                    for pattern in [
+                        'class="erro"', 'class="error"', 'class="alert"',
+                        'class="msg-erro"', 'class="mensagem-erro"',
+                        'class="invalid-feedback"', 'class="field-validation-error"',
+                        'movmodal', 'movmodal', 'alertify',
+                        'documento já cadastrado', 'documento ja cadastrado',
+                        'cpf já cadastrado', 'cpf ja cadastrado',
+                        'já possui cadastro', 'ja possui cadastro',
+                        'recaptcha', 'captcha',
+                        'campo obrigat', 'preencha',
+                    ]:
+                        if pattern in resp_lower:
+                            # Extrair contexto ao redor do match
+                            idx = resp_lower.find(pattern)
+                            context_start = max(0, idx - 100)
+                            context_end = min(len(resp_text), idx + len(pattern) + 200)
+                            error_hints.append(f"[{pattern}] -> ...{resp_text[context_start:context_end]}...")
+
+                    if error_hints:
+                        log("DEBUG", f"  Possiveis indicadores de erro encontrados:")
+                        for hint in error_hints[:5]:
+                            log("DEBUG", f"    {hint[:200]}")
+                        debug_event("cadastro_form_reload_errors", str(error_hints)[:2000])
+
+                        # Verificar CPF duplicado especificamente
+                        if any('cadastrado' in h.lower() or 'duplicado' in h.lower() for h in error_hints):
+                            log("WARN", "CPF DUPLICADO detectado no formulario recarregado!")
+                            await screenshot_debug(page, "06_post_submit")
+                            await page.close()
+                            return "cpf_duplicado"
+                    else:
+                        log("DEBUG", "  Nenhum indicador de erro especifico encontrado no body")
+                        log("DEBUG", f"  Body primeiros 1000 chars: {resp_text[:1000]}")
+                        log("DEBUG", f"  Body ultimos 1000 chars: {resp_text[-1000:]}")
+
+                    debug_event("cadastro_form_reload", f"URL={final_url} | body_len={len(resp_text)}")
+                    await screenshot_debug(page, "06_post_submit")
+                    await page.close()
+                    return "erro_generico"
+
+                # Verificar sucesso REAL no corpo (pagina diferente do formulario)
                 success_in_body = any(s in resp_lower for s in [
                     "cadastro efetuado com sucesso",
                     "bem vindo", "bem-vindo",
                     "confirmar seu cadastro",
                     "e-mail de confirma",
+                    "verifique seu e-mail",
+                    "enviamos um e-mail",
+                    "conta criada",
                 ])
                 if success_in_body:
-                    log("OK", "CADASTRO EFETUADO COM SUCESSO! (detectado no corpo HTTP 200)")
+                    matched_success = [s for s in [
+                        "cadastro efetuado com sucesso", "bem vindo", "bem-vindo",
+                        "confirmar seu cadastro", "e-mail de confirma",
+                        "verifique seu e-mail", "enviamos um e-mail", "conta criada",
+                    ] if s in resp_lower]
+                    log("OK", f"CADASTRO EFETUADO COM SUCESSO! (detectado no corpo: {matched_success})")
                     STATS["cadastros_ok"] += 1
                     await screenshot_debug(page, "06_post_submit")
                     await page.close()
@@ -1089,7 +1156,7 @@ async def fazer_cadastro_playwright(context, pessoa, email, senha):
                     await page.close()
                     return "cpf_duplicado"
 
-                # Verificar erro de validação ESPECÍFICO (não genérico)
+                # Verificar erro de validação ESPECÍFICO
                 error_patterns = [
                     "erro ao cadastrar", "erro no cadastro",
                     "campo obrigatório", "campo obrigatorio",
@@ -1108,21 +1175,20 @@ async def fazer_cadastro_playwright(context, pessoa, email, senha):
                     await page.close()
                     return "erro_generico"
 
-                # HTTP 200 sem indicadores claros - logar body para análise
-                log("WARN", f"HTTP 200 sem indicadores claros")
-                log("DEBUG", f"  Response URL: {submit_resp.url}")
-                log("DEBUG", f"  Response body (primeiros 500 chars): {resp_text[:500]}")
-                log("DEBUG", f"  Response body (últimos 500 chars): {resp_text[-500:]}")
-                debug_event("cadastro_http200_unclear", resp_text[:1000])
+                # V7.8: HTTP 200 sem formulário e sem indicadores claros
+                # Pode ser uma página intermediária - logar TUDO para análise
+                log("WARN", f"HTTP 200 sem formulario e sem indicadores claros")
+                log("DEBUG", f"  Final URL: {final_url}")
+                log("DEBUG", f"  Body length: {len(resp_text)} chars")
+                log("DEBUG", f"  Body primeiros 1500 chars: {resp_text[:1500]}")
+                log("DEBUG", f"  Body ultimos 1500 chars: {resp_text[-1500:]}")
+                debug_event("cadastro_http200_unclear", resp_text[:3000])
                 await screenshot_debug(page, "06_post_submit")
                 await page.close()
-                # Não retornar erro_generico imediatamente - pode ser sucesso
-                # Se a URL mudou ou tem indicadores de sucesso parcial, considerar
-                if "/usuario/cadastro" not in str(submit_resp.url):
-                    log("OK", f"URL mudou para {submit_resp.url} - possível sucesso!")
-                    STATS["cadastros_ok"] += 1
-                    return "sucesso"
-                return "erro_generico"
+
+                # V7.8: NÃO assumir sucesso! Retornar como incerto para investigação
+                log("WARN", "Retornando como 'incerto' - NAO assumir sucesso sem evidencia")
+                return "incerto"
 
             # HTTP 4xx/5xx = erro
             else:

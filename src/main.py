@@ -2,29 +2,27 @@
 # -*- coding: utf-8 -*-
 """
 ╔══════════════════════════════════════════════════════════════╗
-║     AJATO TOKEN GENERATOR V7.6 - HTTP DIRECT SUBMIT        ║
+║     AJATO TOKEN GENERATOR V7.8 - MODO TESTE EMAIL          ║
 ║     Playwright + HTTP POST Direto + Smart CPF Retry            ║
 ║     Otimizado para Kali Linux NetHunter                      ║
 ╚══════════════════════════════════════════════════════════════╝
 
-Fluxo principal:
-  1. Gerar email temporário (Emailnator)
+Fluxo V7.8 (MODO TESTE):
+  1. PEDIR EMAIL DO USUARIO (input manual)
   2. Gerar dados de pessoa (4devs)
   3. Gerar senha segura
   4. Cadastrar na Movida (Playwright + reCAPTCHA Enterprise)
-  5. Aguardar email de confirmação
-  6. Ativar conta via link
-  7. Fazer login e extrair token
-  8. Salvar token no arquivo
-  9. Criar ZIP com logs + screenshots do ciclo
+  5. PARAR e mostrar dados - usuario verifica email manualmente
+  6. Se usuario confirmar email recebido -> continuar com ativacao/login
+  7. Se nao -> diagnostico de falso positivo confirmado
 
-NOVIDADES V7.6:
-  - HTTP DIRECT SUBMIT: POST HTTP direto ao invés de clicar no botão ENVIAR
-  - Resolve o problema do grecaptcha.enterprise não carregar no headless
-  - Extrai cookies do Playwright + campos do formulário via JS
-  - Faz POST para /usuario/enviar-cadastro com token reCAPTCHA HTTP
-  - Detecção precisa: HTTP 303=sucesso, verifica corpo para erros
-  - Debug logs completo em /sdcard/nh_files/logs/ com ZIP automático
+NOVIDADES V7.8:
+  - MODO TESTE: Emailnator DESATIVADO temporariamente
+  - Pede email real do usuario no inicio de cada ciclo
+  - Apos cadastro, PARA e espera confirmacao manual do usuario
+  - Corrigido falso positivo na deteccao de sucesso HTTP 200
+  - Body completo logado (10000 chars) para analise
+  - Objetivo: confirmar se cadastro realmente funciona
 """
 
 import os
@@ -54,7 +52,8 @@ from logger import (
     limpar_screenshots, limpar_logs_ciclo,
     STATS, CURRENT_CYCLE, SESSION_ID,
 )
-from emailnator_module import Emailnator
+# Emailnator DESATIVADO no modo teste
+# from emailnator_module import Emailnator
 from pessoa_generator import gerar_pessoa_4devs, gerar_senha
 from movida_playwright import (
     criar_browser, fazer_cadastro_playwright,
@@ -77,9 +76,9 @@ def print_banner():
 ║{C.CY}   | | | || |_| | | | | | | \\ \\_/ /                            {C.MG}║
 ║{C.CY}   \\_| |_/ \\___/\\_| |_/ \\_/  \\___/                             {C.MG}║
 ║                                                              ║
-║{C.G}   TOKEN GENERATOR V7.6 - HTTP DIRECT SUBMIT          {C.MG}║
+║{C.G}   TOKEN GENERATOR V7.8 - MODO TESTE EMAIL             {C.MG}║
 ║{C.Y}   Otimizado para Kali Linux NetHunter                       {C.MG}║
-║{C.CY}   Smart CPF Retry + AJAX Submit + HTTP reCAPTCHA Bypass                     {C.MG}║
+║{C.BG_Y}{C.W}   >>> EMAILNATOR DESATIVADO - TESTE COM EMAIL REAL <<<      {C.R}{C.MG}║
 ║{C.W}   Debug Logs + ZIP em /sdcard/nh_files/logs/               {C.MG}║
 ╚══════════════════════════════════════════════════════════════╝{C.R}
 """)
@@ -89,6 +88,60 @@ def print_banner():
     log("INFO", f"Base dir: {C.CY}{BASE_DIR}{C.R}")
     log("INFO", f"Logs dir: {C.CY}{LOGS_DIR}{C.R}")
     log("INFO", f"Session ID: {C.CY}{SESSION_ID}{C.R}")
+    print()
+    log("WARN", f"{C.BG_Y}{C.W} MODO TESTE ATIVO - Emailnator desativado {C.R}")
+    log("INFO", "Voce vai colar seu email real para testar se o cadastro funciona")
+    log("INFO", "Apos o cadastro, verifique sua caixa de entrada manualmente")
+    print()
+
+
+# ==============================================================================
+# PEDIR EMAIL DO USUARIO
+# ==============================================================================
+
+def pedir_email_usuario():
+    """Pede para o usuario colar um email real para teste."""
+    print(f"{C.MG}{'='*60}{C.R}")
+    print(f"{C.B}{C.CY}  COLE SEU EMAIL PARA TESTE{C.R}")
+    print(f"{C.MG}{'='*60}{C.R}")
+    print()
+    print(f"  {C.Y}O script vai usar esse email para fazer o cadastro na Movida.{C.R}")
+    print(f"  {C.Y}Apos o cadastro, verifique se o email de confirmacao chegou.{C.R}")
+    print()
+
+    while True:
+        try:
+            email = input(f"  {C.G}>>> Cole seu email aqui: {C.W}").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            log("INFO", "Cancelado pelo usuario.")
+            return None
+
+        if not email:
+            print(f"  {C.RD}Email vazio! Tente novamente.{C.R}")
+            continue
+
+        # Validação básica de email
+        if "@" not in email or "." not in email:
+            print(f"  {C.RD}Email invalido! Deve conter @ e dominio.{C.R}")
+            continue
+
+        # Confirmar
+        print()
+        print(f"  {C.CY}Email informado: {C.B}{C.W}{email}{C.R}")
+        try:
+            confirma = input(f"  {C.Y}Confirma? (S/n): {C.W}").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+
+        if confirma in ("", "s", "sim", "y", "yes"):
+            print()
+            log("OK", f"Email de teste: {C.G}{email}{C.R}")
+            return email
+        else:
+            print(f"  {C.Y}Ok, digite novamente...{C.R}")
+            print()
 
 
 # ==============================================================================
@@ -117,17 +170,16 @@ def salvar_token(token, email, cpf, nome, senha):
 
 
 # ==============================================================================
-# CICLO PRINCIPAL (ASYNC)
+# CICLO PRINCIPAL - MODO TESTE (ASYNC)
 # ==============================================================================
 
-async def executar_ciclo(cycle_num, playwright):
-    """Executa um ciclo completo de geração de token."""
-    log_separator(f"CICLO #{cycle_num}")
+async def executar_ciclo_teste(cycle_num, playwright, email_usuario):
+    """Executa um ciclo de teste com email real do usuario."""
+    log_separator(f"CICLO TESTE #{cycle_num}")
     cycle_start = time.time()
 
     browser = None
     context = None
-    emailnator = None
     token = None
     status = None
 
@@ -138,33 +190,13 @@ async def executar_ciclo(cycle_num, playwright):
         log("PW", "Iniciando browser Playwright...")
         browser, context = await criar_browser(playwright)
 
+        email = email_usuario
+
         # =============================================
-        # PASSO 1: Gerar Email Temporário
+        # PASSO 1: Email ja fornecido pelo usuario
         # =============================================
-        log("STEP", "PASSO 1: Gerando Gmail temporario (Emailnator)...")
-
-        emailnator = Emailnator(playwright_context=context)
-
-        email = None
-        for email_type in EMAIL_TYPES_PRIORITY:
-            email = await emailnator.generate_email_async(email_type)
-            if email:
-                break
-
-        if not email:
-            log("FAIL", "Nao foi possivel gerar email temporario!")
-            STATS["cadastros_fail"] += 1
-            await browser.close()
-            debug_session_end(cycle_num, False, error="email_generation_failed")
-            return False
-
-        log("OK", f"Email gerado: {C.G}{email}{C.R}")
-
-        # Verificar inbox inicial
-        log("DEBUG", "Verificando inbox inicial (pre-cadastro)...")
-        initial_msgs = await emailnator.get_messages_async()
-        if initial_msgs is not None:
-            log("DEBUG", f"Inbox inicial: {len(initial_msgs)} mensagens")
+        log("STEP", f"PASSO 1: Usando email do usuario: {C.G}{email}{C.R}")
+        debug_event("email_manual", email)
 
         # =============================================
         # PASSO 2: Gerar Dados de Pessoa
@@ -175,7 +207,6 @@ async def executar_ciclo(cycle_num, playwright):
         if not pessoa:
             log("FAIL", "Nao foi possivel gerar pessoa!")
             STATS["cadastros_fail"] += 1
-            await emailnator.close()
             await browser.close()
             debug_session_end(cycle_num, False, error="pessoa_generation_failed")
             return False
@@ -204,7 +235,7 @@ async def executar_ciclo(cycle_num, playwright):
         # PASSO 4-6: Cadastro via Playwright (V7.6 HTTP Direct Submit)
         # =============================================
         cadastro_status = None
-        max_cpf_retries = 5  # Máximo de CPFs diferentes para tentar
+        max_cpf_retries = 5
         cpf_attempt = 0
 
         for tentativa in range(1, MAX_CADASTRO_RETRIES + 1):
@@ -214,7 +245,6 @@ async def executar_ciclo(cycle_num, playwright):
             cadastro_status = await fazer_cadastro_playwright(context, pessoa, email, senha)
             log("DEBUG", f"  Resultado cadastro: {cadastro_status}")
 
-            # V7.6: Retorno inteligente com status string
             if cadastro_status == "sucesso":
                 log("OK", f"Cadastro SUCESSO na tentativa {tentativa}!")
                 break
@@ -227,7 +257,6 @@ async def executar_ciclo(cycle_num, playwright):
                     log("FAIL", f"Esgotou {max_cpf_retries} tentativas de CPF diferente!")
                     break
 
-                # Gerar NOVA pessoa com CPF diferente
                 log("STEP", f"Gerando NOVO CPF/pessoa (tentativa CPF #{cpf_attempt + 1})...")
                 nova_pessoa = gerar_pessoa_4devs()
                 if nova_pessoa:
@@ -250,157 +279,134 @@ async def executar_ciclo(cycle_num, playwright):
                 await asyncio.sleep(2)
                 continue
 
-            else:  # erro_generico ou qualquer outro
+            else:
                 log("WARN", f"Cadastro falhou com status '{cadastro_status}' (tentativa {tentativa})")
                 if tentativa < MAX_CADASTRO_RETRIES:
                     await asyncio.sleep(2)
 
-        if cadastro_status != "sucesso":
-            log("FAIL", f"Cadastro falhou! Status final: {cadastro_status}")
-            STATS["cadastros_fail"] += 1
-            debug_session_end(cycle_num, False, error=f"cadastro_{cadastro_status}")
-            await emailnator.close()
-            await browser.close()
-            return False
-
         # =============================================
-        # PASSO 7: Aguardar Email de Confirmação
+        # RESULTADO DO CADASTRO - MODO TESTE
         # =============================================
-        log("STEP", "PASSO 7: Aguardando email de confirmacao...")
+        print()
+        print(f"{C.MG}{'='*60}{C.R}")
+        print(f"{C.B}{C.CY}  RESULTADO DO CADASTRO - MODO TESTE{C.R}")
+        print(f"{C.MG}{'='*60}{C.R}")
+        print()
+        print(f"  {C.W}Status do cadastro: ", end="")
 
-        confirmation_link = await emailnator.wait_for_email_async(
-            sender_filter="movida",
-            timeout=EMAIL_CONFIRM_TIMEOUT,
-            link_pattern="sendgrid",
-        )
+        if cadastro_status == "sucesso":
+            print(f"{C.BG_G}{C.W} SUCESSO (segundo o script) {C.R}")
+        else:
+            print(f"{C.BG_R}{C.W} FALHOU: {cadastro_status} {C.R}")
 
-        if not confirmation_link:
-            log("WARN", "Email da Movida nao chegou, tentando qualquer email...")
-            confirmation_link = await emailnator.wait_for_email_async(
-                sender_filter="",
-                timeout=30,
-                link_pattern="sendgrid",
-                accept_any=True,
-            )
+        print()
+        print(f"  {C.CY}Dados usados:{C.R}")
+        print(f"  {C.W}  Email: {C.G}{email}{C.R}")
+        print(f"  {C.W}  Nome:  {C.G}{nome}{C.R}")
+        print(f"  {C.W}  CPF:   {C.G}{cpf}{C.R}")
+        print(f"  {C.W}  Senha: {C.G}{senha}{C.R}")
+        print()
+        print(f"{C.MG}{'='*60}{C.R}")
+        print()
 
-        if not confirmation_link:
-            log("FAIL", "Email de confirmacao nao chegou!")
-            STATS["emails_timeout"] += 1
+        if cadastro_status in ("sucesso", "incerto"):
+            if cadastro_status == "incerto":
+                print(f"  {C.BG_Y}{C.W} RESULTADO INCERTO - HTTP 200 sem formulario, sem indicadores claros {C.R}")
+                print(f"  {C.Y}O servidor retornou algo diferente do esperado.{C.R}")
+                print(f"  {C.Y}Verifique seu email para confirmar se o cadastro funcionou.{C.R}")
+                print()
+            print(f"  {C.BG_Y}{C.W} AGORA VERIFIQUE SUA CAIXA DE EMAIL! {C.R}")
+            print()
+            print(f"  {C.Y}Verifique:{C.R}")
+            print(f"  {C.W}  1. Caixa de entrada{C.R}")
+            print(f"  {C.W}  2. Spam / Lixo eletronico{C.R}")
+            print(f"  {C.W}  3. Aba 'Promocoes' (Gmail){C.R}")
+            print(f"  {C.W}  4. Aba 'Atualizacoes' (Gmail){C.R}")
+            print()
+            print(f"  {C.Y}O email deve ser de: {C.W}Movida / noreply / sendgrid{C.R}")
+            print()
 
-            # Tentar login direto
-            log("WARN", "Tentando login direto sem confirmacao...")
-            token, status = await fazer_login_playwright(context, cpf_numeros, senha)
-            if token and status == "ok":
-                salvar_token(token, email, cpf, nome, senha)
-                debug_session_end(cycle_num, True, token=token[:30])
-                await emailnator.close()
+            try:
+                resposta = input(f"  {C.G}>>> O email de confirmacao chegou? (s/N): {C.W}").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                resposta = "n"
+
+            if resposta in ("s", "sim", "y", "yes"):
+                print()
+                log("OK", f"{C.BG_G}{C.W} EMAIL CONFIRMADO! O cadastro FUNCIONA! {C.R}")
+                log("OK", "O problema era no Emailnator, nao no cadastro.")
+                debug_event("teste_email_ok", f"Email chegou em {email}")
+
+                # Perguntar se quer continuar com ativacao
+                print()
+                try:
+                    continuar = input(f"  {C.Y}>>> Cole o link de confirmacao do email (ou Enter para pular): {C.W}").strip()
+                except (EOFError, KeyboardInterrupt):
+                    continuar = ""
+
+                if continuar and continuar.startswith("http"):
+                    log("STEP", "Ativando conta com link fornecido...")
+                    ativacao_ok = await ativar_conta_playwright(context, continuar, senha)
+                    if ativacao_ok:
+                        log("OK", "Conta ativada com sucesso!")
+                        await asyncio.sleep(ACTIVATION_DELAY)
+
+                        # Tentar login
+                        log("STEP", "Tentando login...")
+                        token, status = await fazer_login_playwright(context, cpf_numeros, senha)
+                        if token and status == "ok":
+                            salvar_token(token, email, cpf, nome, senha)
+                            log("OK", f"{C.BG_G}{C.W} FLUXO COMPLETO COM SUCESSO! {C.R}")
+                            debug_session_end(cycle_num, True, token=token[:30])
+                            await browser.close()
+                            return True
+                        else:
+                            log("WARN", f"Login falhou: {status}")
+                    else:
+                        log("WARN", "Ativacao falhou")
+                else:
+                    log("INFO", "Pulando ativacao - teste concluido com sucesso parcial")
+
+                debug_session_end(cycle_num, True, token="teste_email_ok")
                 await browser.close()
                 return True
 
-            debug_session_end(cycle_num, False, error="email_timeout")
-            await emailnator.close()
-            await browser.close()
-            return False
-
-        log("OK", f"Link de confirmacao: {confirmation_link[:80]}...")
-        STATS["emails_recebidos"] += 1
-
-        # =============================================
-        # PASSO 8: Ativar Conta
-        # =============================================
-        log("STEP", "PASSO 8: Ativando conta...")
-
-        ativacao_ok = await ativar_conta_playwright(context, confirmation_link, senha)
-
-        if not ativacao_ok:
-            log("WARN", "Ativacao falhou, tentando login mesmo assim...")
-
-        await asyncio.sleep(ACTIVATION_DELAY)
-
-        # =============================================
-        # PASSO 9: Login e Extração de Token
-        # =============================================
-        log("STEP", "PASSO 9: Fazendo login e extraindo token...")
-
-        for login_try in range(1, MAX_LOGIN_RETRIES + 1):
-            log("DEBUG", f"Tentativa de login {login_try}/{MAX_LOGIN_RETRIES}...")
-
-            token, status = await fazer_login_playwright(context, cpf_numeros, senha)
-
-            if token and status == "ok":
-                log("OK", f"Login OK na tentativa {login_try}!")
-                break
-
-            if status == "nao_confirmado":
-                log("WARN", "Conta nao confirmada! Tentando reativacao...")
-                STATS["reativacoes"] += 1
-
-                for reactivation in range(MAX_REACTIVATION_ATTEMPTS):
-                    log("DEBUG", f"Reativacao tentativa {reactivation + 1}...")
-                    new_link = await emailnator.wait_for_email_async(
-                        sender_filter="movida",
-                        timeout=30,
-                        link_pattern="sendgrid",
-                    )
-                    if new_link:
-                        await ativar_conta_playwright(context, new_link, senha)
-                        await asyncio.sleep(ACTIVATION_DELAY)
-                        token, status = await fazer_login_playwright(context, cpf_numeros, senha)
-                        if token and status == "ok":
-                            break
-                if token and status == "ok":
-                    break
-
-            elif status == "senha_invalida":
-                log("WARN", "Senha invalida! Tentando recuperacao...")
-                nova_senha = gerar_senha()
-                recuperou = await recuperar_senha(context, emailnator, cpf_numeros, email, nova_senha)
-                if recuperou:
-                    senha = nova_senha
-                    await asyncio.sleep(2)
-                    token, status = await fazer_login_playwright(context, cpf_numeros, senha)
-                    if token and status == "ok":
-                        break
-
-            elif status == "incomplete_data":
-                log("WARN", "Dados incompletos! Tentando login direto...")
-                await asyncio.sleep(2)
-                continue
-
             else:
-                log("WARN", f"Login falhou com status: {status}")
-                if login_try < MAX_LOGIN_RETRIES:
-                    await asyncio.sleep(2)
+                print()
+                log("WARN", f"{C.BG_R}{C.W} EMAIL NAO CHEGOU! {C.R}")
+                log("WARN", "Isso confirma que o cadastro retorna FALSO POSITIVO.")
+                log("WARN", "O POST HTTP retorna HTTP 200 mas NAO efetua o cadastro.")
+                debug_event("teste_email_fail", f"Email NAO chegou em {email}")
+                debug_event("diagnostico", "FALSO POSITIVO confirmado - HTTP 200 sem cadastro real")
 
-        # =============================================
-        # PASSO 10: Salvar Token
-        # =============================================
-        if token and status == "ok":
-            salvar_token(token, email, cpf, nome, senha)
-            elapsed = time.time() - cycle_start
-            log("OK", f"{C.BG_G}{C.W} CICLO #{cycle_num} CONCLUIDO COM SUCESSO! ({elapsed:.1f}s) {C.R}")
-            debug_session_end(cycle_num, True, token=token[:30])
-            await emailnator.close()
-            await browser.close()
-            return True
+                print()
+                print(f"  {C.CY}Diagnostico:{C.R}")
+                print(f"  {C.W}  O servidor retorna HTTP 200 com a mesma pagina de cadastro{C.R}")
+                print(f"  {C.W}  Isso indica que o POST falhou silenciosamente{C.R}")
+                print(f"  {C.W}  Possiveis causas:{C.R}")
+                print(f"  {C.Y}    1. Token reCAPTCHA invalido/expirado{C.R}")
+                print(f"  {C.Y}    2. Falta de campo obrigatorio no POST{C.R}")
+                print(f"  {C.Y}    3. Cookie de sessao nao vinculado ao form{C.R}")
+                print(f"  {C.Y}    4. Validacao server-side rejeitando silenciosamente{C.R}")
+                print()
+
+                STATS["cadastros_fail"] += 1
+                debug_session_end(cycle_num, False, error="falso_positivo_confirmado")
+                await browser.close()
+                return False
+
         else:
-            elapsed = time.time() - cycle_start
-            log("FAIL", f"Ciclo #{cycle_num} falhou! Status final: {status} ({elapsed:.1f}s)")
-            STATS["logins_fail"] += 1
-            debug_session_end(cycle_num, False, error=f"login_{status}")
-            await emailnator.close()
+            log("FAIL", f"Cadastro falhou com status: {cadastro_status}")
+            log("INFO", "O script detectou a falha corretamente desta vez.")
+            STATS["cadastros_fail"] += 1
+            debug_session_end(cycle_num, False, error=f"cadastro_{cadastro_status}")
             await browser.close()
             return False
 
     except Exception as e:
-        log("FAIL", f"Erro no ciclo #{cycle_num}: {str(e)}")
-        debug_error(f"Ciclo #{cycle_num}: {str(e)}", traceback.format_exc())
+        log("FAIL", f"Erro no ciclo teste #{cycle_num}: {str(e)}")
+        debug_error(f"Ciclo teste #{cycle_num}: {str(e)}", traceback.format_exc())
         debug_session_end(cycle_num, False, error=f"exception: {str(e)[:100]}")
-        if emailnator:
-            try:
-                await emailnator.close()
-            except Exception:
-                pass
         if browser:
             try:
                 await browser.close()
@@ -410,54 +416,51 @@ async def executar_ciclo(cycle_num, playwright):
 
 
 # ==============================================================================
-# LOOP PRINCIPAL
+# LOOP PRINCIPAL - MODO TESTE
 # ==============================================================================
 
 async def main_loop():
-    """Loop principal de geração de tokens."""
+    """Loop principal - MODO TESTE com email manual."""
     from playwright.async_api import async_playwright
 
     print_banner()
 
     cycle_num = 0
-    consecutive_fails = 0
-    max_consecutive_fails = 5
 
     async with async_playwright() as playwright:
         while True:
+            # Pedir email do usuario a cada ciclo
+            email_usuario = pedir_email_usuario()
+            if not email_usuario:
+                log("INFO", "Nenhum email fornecido. Encerrando.")
+                break
+
             cycle_num += 1
 
             try:
-                # Limpar screenshots do ciclo anterior
                 limpar_screenshots()
 
-                success = await executar_ciclo(cycle_num, playwright)
+                success = await executar_ciclo_teste(cycle_num, playwright, email_usuario)
 
-                # =============================================
-                # ZIP DO CICLO (logs + screenshots)
-                # =============================================
+                # ZIP do ciclo
                 zip_path = criar_zip_ciclo(cycle_num, include_screenshots=True)
                 if zip_path:
                     log("ZIP", f"Logs do ciclo #{cycle_num} compactados!")
                     log("ZIP", f"Arquivo: {zip_path}")
 
-                # Rotacionar logs se muito grandes
                 limpar_logs_ciclo()
+                log_stats()
 
-                if success:
-                    consecutive_fails = 0
-                    log_stats()
-                else:
-                    consecutive_fails += 1
-                    log_stats()
+                # Perguntar se quer testar novamente
+                print()
+                try:
+                    novamente = input(f"  {C.Y}>>> Testar novamente com outro email? (s/N): {C.W}").strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    novamente = "n"
 
-                    if consecutive_fails >= max_consecutive_fails:
-                        log("WARN", f"{consecutive_fails} falhas consecutivas. Aguardando 10s...")
-                        consecutive_fails = 0
-                        await asyncio.sleep(10)
-                    else:
-                        log("WARN", f"Ciclo #{cycle_num} falhou. Aguardando 5s...")
-                        await asyncio.sleep(5)
+                if novamente not in ("s", "sim", "y", "yes"):
+                    log("INFO", "Encerrando modo teste.")
+                    break
 
             except KeyboardInterrupt:
                 log("INFO", "Interrompido pelo usuario (Ctrl+C)")
@@ -466,10 +469,8 @@ async def main_loop():
             except Exception as e:
                 log("FAIL", f"Erro fatal no ciclo #{cycle_num}: {str(e)}")
                 debug_error(f"Fatal ciclo #{cycle_num}: {str(e)}", traceback.format_exc())
-                # ZIP mesmo em caso de erro fatal
                 criar_zip_ciclo(cycle_num, include_screenshots=True)
-                consecutive_fails += 1
-                await asyncio.sleep(5)
+                await asyncio.sleep(2)
 
 
 # ==============================================================================
@@ -481,7 +482,6 @@ def main():
     def signal_handler(sig, frame):
         print(f"\n{C.Y}[INFO]{C.R} Encerrando gracefully...")
         log_stats()
-        # Criar ZIP final da sessão
         zip_path = criar_zip_sessao()
         if zip_path:
             print(f"{C.G}[ZIP]{C.R} Sessao completa salva em: {zip_path}")
@@ -495,14 +495,12 @@ def main():
     except KeyboardInterrupt:
         print(f"\n{C.Y}[INFO]{C.R} Encerrado pelo usuario.")
         log_stats()
-        # ZIP final
         zip_path = criar_zip_sessao()
         if zip_path:
             print(f"{C.G}[ZIP]{C.R} Sessao completa: {zip_path}")
     except Exception as e:
         print(f"\n{C.RD}[FATAL]{C.R} {str(e)}")
         traceback.print_exc()
-        # ZIP mesmo em caso de crash
         criar_zip_sessao()
         sys.exit(1)
 
